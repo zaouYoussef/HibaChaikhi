@@ -8,7 +8,7 @@ const medicamentCreateSchema = z.object({
   nom: z.string().min(1, "Nom requis").max(300),
   principeActif: z.string().min(1, "Principe actif requis").max(300),
   dosage: z.string().min(1, "Dosage requis").max(120),
-  numeroLot: z.string().min(1, "Numéro de lot requis").max(120),
+  numeroLot: z.string().max(120).optional().nullable(),
   quantite: z.coerce.number().int().min(0, "Quantité >= 0"),
   dateExpiration: z.coerce.date({ invalid_type_error: "Date invalide" }),
   codeBarre: z.string().max(120).optional().nullable(),
@@ -381,6 +381,12 @@ router.post("/", async (req, res) => {
     dateExpiration,
     codeBarre,
   } = parsed.data;
+  const lotValue =
+    numeroLot?.trim() ||
+    `AUTO-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${Math.random()
+      .toString(36)
+      .slice(2, 8)
+      .toUpperCase()}`;
 
   const result = await prisma.$transaction(async (tx) => {
     const med = await tx.medicament.upsert({
@@ -406,7 +412,7 @@ router.post("/", async (req, res) => {
       where: {
         medicamentId_numeroLot_dateExpiration: {
           medicamentId: med.id,
-          numeroLot: numeroLot.trim(),
+          numeroLot: lotValue,
           dateExpiration,
         },
       },
@@ -415,7 +421,7 @@ router.post("/", async (req, res) => {
       },
       create: {
         medicamentId: med.id,
-        numeroLot: numeroLot.trim(),
+        numeroLot: lotValue,
         quantite,
         dateExpiration,
       },

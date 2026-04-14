@@ -212,7 +212,7 @@ export default function AddMedicamentPage() {
 
         <div className="relative">
           <label className="block text-xs font-medium text-slate-600 mb-1">
-            Nom commercial ou code-barres (EAN) *
+            Nom commercial *
           </label>
           <input
             ref={nomInputRef}
@@ -293,14 +293,13 @@ export default function AddMedicamentPage() {
           </div>
           <div>
             <label className="block text-xs font-medium text-slate-600 mb-1">
-              Numéro de lot *
+              Numéro de lot (optionnel)
             </label>
             <input
-              required
               className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
               value={form.numeroLot}
               onChange={(e) => update("numeroLot", e.target.value)}
-              placeholder="Ex. LOT-2026-04"
+              placeholder="Ex. LOT-2026-04 (auto si vide)"
             />
           </div>
         </div>

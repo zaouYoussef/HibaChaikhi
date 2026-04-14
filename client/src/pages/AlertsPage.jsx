@@ -4,7 +4,6 @@ import { apiFetch } from "../api.js";
 function formatDate(iso) {
   const d = new Date(iso);
   return d.toLocaleDateString("fr-FR", {
-    weekday: "short",
     day: "2-digit",
     month: "short",
     year: "numeric",
