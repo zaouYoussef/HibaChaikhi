@@ -1,4 +1,5 @@
-const BASE = import.meta.env.VITE_API_URL ?? "";
+const FALLBACK_API_URL = "https://hibachaikhi-production.up.railway.app";
+const BASE = import.meta.env.VITE_API_URL ?? FALLBACK_API_URL;
 
 export function apiUrl(path) {
   if (path.startsWith("http")) return path;
