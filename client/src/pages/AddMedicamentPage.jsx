@@ -81,7 +81,6 @@ export default function AddMedicamentPage() {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [remoteSuggestions, setRemoteSuggestions] = useState([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
-  const [keepCoreFields, setKeepCoreFields] = useState(true);
   const [visionEquivalents, setVisionEquivalents] = useState([]);
   const nomInputRef = useRef(null);
   const suggestRef = useRef(null);
@@ -309,16 +308,12 @@ export default function AddMedicamentPage() {
         }),
       });
       setMsg({ type: "ok", text: "Médicament enregistré." });
-      setForm((prev) =>
-        keepCoreFields
-          ? {
-              ...empty,
-              nom: prev.nom,
-              principeActif: prev.principeActif,
-              dosage: prev.dosage,
-            }
-          : empty
-      );
+      setForm((prev) => ({
+        ...empty,
+        nom: prev.nom,
+        principeActif: prev.principeActif,
+        dosage: "",
+      }));
       const list = await apiFetch("/medicaments");
       if (Array.isArray(list)) setCatalog(list);
     } catch (err) {
@@ -508,18 +503,10 @@ export default function AddMedicamentPage() {
           />
         </div>
 
-        <label className="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
-          <input
-            type="checkbox"
-            checked={keepCoreFields}
-            onChange={(e) => setKeepCoreFields(e.target.checked)}
-            className="mt-0.5"
-          />
-          <span>
-            Garder nom + principe actif + dosage après enregistrement (ajout rapide
-            de plusieurs lots/dosages proches).
-          </span>
-        </label>
+        <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+          Astuce: après enregistrement, le nom et le principe actif sont conservés
+          automatiquement pour accélérer l'ajout d'un autre dosage.
+        </p>
 
         {msg.text && (
           <p

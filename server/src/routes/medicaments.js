@@ -14,6 +14,10 @@ const medicamentCreateSchema = z.object({
   codeBarre: z.string().max(120).optional().nullable(),
 });
 
+function containsInsensitive(value) {
+  return { contains: value, mode: "insensitive" };
+}
+
 function mapMed(m, lot) {
   return {
     id: m.id,
@@ -184,7 +188,7 @@ export async function suggestMedicaments(req, res) {
 
   const localRows = await prisma.medicament.findMany({
     where: {
-      OR: [{ nom: { contains: q } }, { principeActif: { contains: q } }],
+      OR: [{ nom: containsInsensitive(q) }, { principeActif: containsInsensitive(q) }],
     },
     orderBy: { nom: "asc" },
     take: 8,
@@ -197,8 +201,29 @@ export async function suggestMedicaments(req, res) {
     source: "local",
   }));
 
+  const eqRows = await prisma.equivalent.findMany({
+    where: {
+      OR: [
+        { nomMedicament: containsInsensitive(q) },
+        { principeActif: containsInsensitive(q) },
+      ],
+    },
+    orderBy: { nomMedicament: "asc" },
+    take: 8,
+  });
+  const referenceSuggestions = eqRows.map((e) => ({
+    nom: e.nomMedicament,
+    dosage: "",
+    principeActif: e.principeActif,
+    source: "reference",
+  }));
+
   const externalSuggestions = await fetchRxNormSuggestions(q);
-  const merged = [...localSuggestions, ...externalSuggestions];
+  const merged = [
+    ...localSuggestions,
+    ...referenceSuggestions,
+    ...externalSuggestions,
+  ];
   const seen = new Set();
   const items = [];
 
@@ -219,7 +244,7 @@ export async function autocompleteMedicaments(req, res) {
   const { items } = await (async () => {
     const localRows = await prisma.medicament.findMany({
       where: {
-        OR: [{ nom: { contains: q } }, { principeActif: { contains: q } }],
+        OR: [{ nom: containsInsensitive(q) }, { principeActif: containsInsensitive(q) }],
       },
       orderBy: { nom: "asc" },
       take: 8,
@@ -252,25 +277,17 @@ export async function searchMedicaments(req, res) {
     return res.status(400).json({ error: "Paramètre q requis" });
   }
 
-  const pattern = { contains: q };
+  const pattern = containsInsensitive(q);
+  const exactPattern = { equals: q, mode: "insensitive" };
 
-  let matches = await prisma.medicament.findMany({
+  const directMatches = await prisma.medicament.findMany({
     where: {
-      OR: [{ nom: pattern }, { principeActif: pattern }],
+      OR: [{ nom: exactPattern }, { nom: pattern }, { principeActif: pattern }],
     },
     include: { lots: true },
   });
 
-  if (matches.length === 0) {
-    const all = await prisma.medicament.findMany({ include: { lots: true } });
-    matches = all
-      .map((m) => ({ med: m, score: fuzzyScore(q, m) }))
-      .filter((entry) => entry.score >= 0.72)
-      .sort((a, b) => b.score - a.score)
-      .map((entry) => entry.med);
-  }
-
-  const directAvailableLots = matches
+  const directAvailableLots = directMatches
     .flatMap((m) =>
       m.lots
         .filter((l) => l.quantite > 0)
@@ -296,16 +313,36 @@ export async function searchMedicaments(req, res) {
   }
 
   const principles = new Set(
-    matches.map((m) => m.principeActif.trim()).filter(Boolean)
+    directMatches.map((m) => m.principeActif.trim()).filter(Boolean)
   );
 
   const equivByName = await prisma.equivalent.findMany({
     where: {
-      OR: [{ nomMedicament: pattern }, { principeActif: pattern }],
+      OR: [
+        { nomMedicament: exactPattern },
+        { nomMedicament: pattern },
+        { principeActif: exactPattern },
+        { principeActif: pattern },
+      ],
     },
   });
   for (const e of equivByName.filter((row) => isValidEquivalentName(row.nomMedicament))) {
     principles.add(e.principeActif.trim());
+  }
+
+  // Fallback approximation: used only to infer active principle,
+  // never to mark query as directly "disponible".
+  if (principles.size === 0) {
+    const all = await prisma.medicament.findMany({ include: { lots: true } });
+    const fuzzyMatches = all
+      .map((m) => ({ med: m, score: fuzzyScore(q, m) }))
+      .filter((entry) => entry.score >= 0.86)
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.med)
+      .slice(0, 3);
+    for (const m of fuzzyMatches) {
+      if (m?.principeActif?.trim()) principles.add(m.principeActif.trim());
+    }
   }
 
   const paList = [...principles];
@@ -315,7 +352,7 @@ export async function searchMedicaments(req, res) {
     altMeds = await prisma.medicament.findMany({
       where: {
         OR: paList.map((pa) => ({
-          principeActif: { equals: pa },
+          principeActif: { equals: pa, mode: "insensitive" },
         })),
       },
       include: { lots: true },
@@ -327,7 +364,7 @@ export async function searchMedicaments(req, res) {
     equivRefs = await prisma.equivalent.findMany({
       where: {
         OR: paList.map((pa) => ({
-          principeActif: { equals: pa },
+          principeActif: { equals: pa, mode: "insensitive" },
         })),
       },
     });
@@ -383,7 +420,7 @@ export async function searchMedicaments(req, res) {
     const recommended = equivalentAvailableLots[0];
     return res.json({
       status: "equivalent_disponible",
-      message: "Médicament demandé indisponible. Équivalent disponible en stock.",
+      message: `Médicament demandé indisponible. Équivalent disponible en stock: ${recommended.medicament.nom}.`,
       recommended: mapMed(recommended.medicament, recommended.lot),
       items: equivalentAvailableLots.map(({ medicament, lot }) =>
         mapMed(medicament, lot)
@@ -550,6 +587,29 @@ router.put("/:id/use", async (req, res) => {
     include: { lots: true },
   });
   res.json(summarizeMedicament(updated));
+});
+
+router.delete("/:id", async (req, res) => {
+  const id = req.params.id;
+  const med = await prisma.medicament.findUnique({
+    where: { id },
+    include: { lots: true },
+  });
+  if (!med) return res.status(404).json({ error: "Médicament introuvable" });
+
+  const stockTotal = (med.lots ?? []).reduce((sum, lot) => sum + lot.quantite, 0);
+  await prisma.medicament.delete({ where: { id } });
+
+  res.json({
+    ok: true,
+    deleted: {
+      id: med.id,
+      nom: med.nom,
+      principeActif: med.principeActif,
+      dosage: med.dosage,
+      stockTotal,
+    },
+  });
 });
 
 export default router;

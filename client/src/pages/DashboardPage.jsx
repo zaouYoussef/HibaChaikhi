@@ -19,6 +19,7 @@ export default function DashboardPage() {
   const [err, setErr] = useState("");
   const [stockFilter, setStockFilter] = useState("all");
   const [medQuery, setMedQuery] = useState("");
+  const [actionMsg, setActionMsg] = useState({ type: "", text: "" });
 
   useEffect(() => {
     let cancelled = false;
@@ -97,13 +98,6 @@ export default function DashboardPage() {
       (m) => m.stockStatus === "critical"
     ).length;
     const lowMeds = sortedMeds.filter((m) => m.stockStatus === "low").length;
-    const healthScore = Math.max(
-      0,
-      Math.min(
-        100,
-        Math.round(100 - (criticalMeds * 8 + lowMeds * 3 + expiredLots * 4))
-      )
-    );
     return {
       totalUnites,
       totalLots,
@@ -111,7 +105,6 @@ export default function DashboardPage() {
       in7Days,
       criticalMeds,
       lowMeds,
-      healthScore,
     };
   }, [sortedMeds, lotsFlat, now]);
 
@@ -199,13 +192,30 @@ export default function DashboardPage() {
       hint: "Médicaments à réapprovisionner vite",
       color: "bg-red-500",
     },
-    {
-      label: "Score santé stock",
-      value: `${dashboardMetrics.healthScore}%`,
-      hint: "Basé sur criticité + péremption",
-      color: "bg-emerald-500",
-    },
   ];
+
+  async function deleteMedicament(item) {
+    if (!confirm(`Supprimer ${item.nom} (${item.dosage}) ?`)) return;
+    setActionMsg({ type: "", text: "" });
+    try {
+      await apiFetch(`/medicaments/${item.id}`, { method: "DELETE" });
+      const [s, list] = await Promise.all([
+        apiFetch("/dashboard/stats"),
+        apiFetch("/medicaments"),
+      ]);
+      setStats(s);
+      setMedicaments(Array.isArray(list) ? list : []);
+      setActionMsg({
+        type: "ok",
+        text: `${item.nom} supprimé avec succès.`,
+      });
+    } catch (e) {
+      setActionMsg({
+        type: "err",
+        text: e?.body?.error || e?.message || "Suppression impossible.",
+      });
+    }
+  }
 
   return (
     <div>
@@ -218,6 +228,17 @@ export default function DashboardPage() {
       <p className="text-slate-600 text-sm mb-8">
         Vue d’ensemble avant et pendant la caravane.
       </p>
+      {actionMsg.text && (
+        <p
+          className={`mb-4 rounded-lg px-3 py-2 text-sm ${
+            actionMsg.type === "err"
+              ? "bg-red-50 text-red-700"
+              : "bg-emerald-50 text-emerald-800"
+          }`}
+        >
+          {actionMsg.text}
+        </p>
+      )}
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {cards.map((c) => (
@@ -391,6 +412,13 @@ export default function DashboardPage() {
                         </span>
                       </p>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => deleteMedicament(m)}
+                      className="mt-2 inline-flex rounded-md bg-red-50 px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-100"
+                    >
+                      Supprimer
+                    </button>
                     {(expired || soon) && (
                       <p
                         className={`mt-2 text-xs font-semibold ${
@@ -470,6 +498,13 @@ export default function DashboardPage() {
                         >
                           {level.label}
                         </span>
+                        <button
+                          type="button"
+                          onClick={() => deleteMedicament(m)}
+                          className="ml-3 text-xs font-semibold text-red-700 hover:underline"
+                        >
+                          Supprimer
+                        </button>
                       </td>
                     </tr>
                   );
