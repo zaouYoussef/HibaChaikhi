@@ -127,10 +127,11 @@ async function extractMedicationWithVisionApi(imageBase64, log = () => {}) {
     log("vision_skipped_invalid_key");
     return null;
   }
-  const configuredModel = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
+  const configuredModel = process.env.VISION_MODEL?.trim() || "gemini-2.5-flash";
   const customEndpoint = process.env.VISION_API_URL?.trim();
   const modelCandidates = [
     configuredModel,
+    "gemini-2.5-flash",
     "gemini-1.5-flash-latest",
     "gemini-2.0-flash",
   ].filter((m, idx, arr) => m && arr.indexOf(m) === idx);
@@ -440,6 +441,41 @@ async function inferMedicationFromOcrText(ocrText) {
   }
 
   if (!best || bestScore < 6) {
+    const principes = await prisma.medicament.findMany({
+      select: { principeActif: true },
+      distinct: ["principeActif"],
+    });
+    const matchedPrincipes = principes
+      .map((p) => cleanText(p.principeActif))
+      .filter(Boolean)
+      .filter((pa) => normalizedOcr.includes(normalizeForMatch(pa)))
+      .sort((a, b) => b.length - a.length);
+
+    if (matchedPrincipes.length > 0) {
+      const principle = matchedPrincipes[0];
+      const candidate = await prisma.medicament.findFirst({
+        where: { principeActif: { equals: principle } },
+        orderBy: { nom: "asc" },
+      });
+      if (candidate) {
+        return {
+          status: "partial",
+          confidence: 0.62,
+          medicament: {
+            id: candidate.id,
+            nom: candidate.nom,
+            principeActif: candidate.principeActif,
+            dosage:
+              extractDosageCandidates(ocrText)[0] || candidate.dosage || "",
+            source: "vision_ocr_principe",
+          },
+          equivalents: [],
+          message:
+            "Principe actif détecté via OCR. Vérifiez le dosage avant enregistrement.",
+        };
+      }
+    }
+
     return {
       status: "not_found",
       confidence: 0,
