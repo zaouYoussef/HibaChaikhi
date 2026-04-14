@@ -265,12 +265,12 @@ export async function searchMedicaments(req, res) {
     const all = await prisma.medicament.findMany({ include: { lots: true } });
     matches = all
       .map((m) => ({ med: m, score: fuzzyScore(q, m) }))
-      .filter((entry) => entry.score >= 0.45)
+      .filter((entry) => entry.score >= 0.72)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.med);
   }
 
-  const availableLots = matches
+  const directAvailableLots = matches
     .flatMap((m) =>
       m.lots
         .filter((l) => l.quantite > 0)
@@ -282,13 +282,16 @@ export async function searchMedicaments(req, res) {
         new Date(b.lot.dateExpiration).getTime()
     );
 
-  if (availableLots.length > 0) {
-    const recommended = availableLots[0];
+  if (directAvailableLots.length > 0) {
+    const recommended = directAvailableLots[0];
     return res.json({
       status: "disponible",
       message: null,
       recommended: mapMed(recommended.medicament, recommended.lot),
-      items: availableLots.map(({ medicament, lot }) => mapMed(medicament, lot)),
+      items: directAvailableLots.map(({ medicament, lot }) =>
+        mapMed(medicament, lot)
+      ),
+      requestedQuery: q,
     });
   }
 
@@ -379,13 +382,14 @@ export async function searchMedicaments(req, res) {
   if (equivalentAvailableLots.length > 0) {
     const recommended = equivalentAvailableLots[0];
     return res.json({
-      status: "disponible",
-      message: "Équivalent disponible en stock",
+      status: "equivalent_disponible",
+      message: "Médicament demandé indisponible. Équivalent disponible en stock.",
       recommended: mapMed(recommended.medicament, recommended.lot),
       items: equivalentAvailableLots.map(({ medicament, lot }) =>
         mapMed(medicament, lot)
       ),
       equivalents,
+      requestedQuery: q,
     });
   }
 
@@ -395,6 +399,7 @@ export async function searchMedicaments(req, res) {
     recommended: null,
     items: [],
     equivalents,
+    requestedQuery: q,
   });
 }
 

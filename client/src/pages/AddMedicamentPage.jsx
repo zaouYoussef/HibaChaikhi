@@ -37,6 +37,39 @@ function isLikelyMedicationName(value) {
   return /[a-zA-Z]/.test(v);
 }
 
+function extractDosageFromText(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  const dosageRegex =
+    /\b\d+(?:[.,]\d+)?\s*(?:mg|g|mcg|ug|ml|ui|iu|mui|%)(?:\s*\/\s*\d+(?:[.,]\d+)?\s*(?:mg|g|mcg|ug|ml|ui|iu|mui|%))*\b/i;
+  const match = text.match(dosageRegex);
+  return match?.[0]?.trim() || "";
+}
+
+function splitCommercialNameAndDosage(rawName, rawDosage) {
+  const sourceName = String(rawName ?? "").trim();
+  const sourceDosage = String(rawDosage ?? "").trim();
+
+  if (!sourceName) {
+    return { nom: "", dosage: sourceDosage };
+  }
+
+  const dosage = sourceDosage || extractDosageFromText(sourceName);
+  let nom = sourceName;
+
+  if (dosage) {
+    const idx = sourceName.toLowerCase().indexOf(dosage.toLowerCase());
+    if (idx > 0) {
+      nom = sourceName.slice(0, idx).trim();
+    }
+  } else if (sourceName.includes(",")) {
+    nom = sourceName.split(",")[0].trim();
+  }
+
+  nom = nom.replace(/[-,;:\s]+$/g, "").trim();
+  return { nom, dosage };
+}
+
 export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
@@ -46,6 +79,9 @@ export default function AddMedicamentPage() {
   const [loading, setLoading] = useState(false);
   const [catalog, setCatalog] = useState([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const [remoteSuggestions, setRemoteSuggestions] = useState([]);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [keepCoreFields, setKeepCoreFields] = useState(true);
   const [visionEquivalents, setVisionEquivalents] = useState([]);
   const nomInputRef = useRef(null);
   const suggestRef = useRef(null);
@@ -71,7 +107,7 @@ export default function AddMedicamentPage() {
     return () => window.removeEventListener("popstate", onPopState);
   }, [navigate]);
 
-  const suggestions = useMemo(() => {
+  const localSuggestions = useMemo(() => {
     const q = form.nom.trim().toLowerCase();
     if (q.length < 2) return [];
     const templates = uniqueTemplates(catalog);
@@ -83,6 +119,54 @@ export default function AddMedicamentPage() {
       )
       .slice(0, 8);
   }, [form.nom, catalog]);
+
+  useEffect(() => {
+    const q = form.nom.trim();
+    if (q.length < 2) {
+      setRemoteSuggestions([]);
+      setSuggestLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setSuggestLoading(true);
+      try {
+        const data = await apiFetch(`/suggest?q=${encodeURIComponent(q)}`);
+        if (!cancelled) {
+          const list = Array.isArray(data?.items) ? data.items : [];
+          setRemoteSuggestions(list.slice(0, 8));
+        }
+      } catch {
+        if (!cancelled) setRemoteSuggestions([]);
+      } finally {
+        if (!cancelled) setSuggestLoading(false);
+      }
+    }, 220);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [form.nom]);
+
+  const suggestions = useMemo(() => {
+    const merged = [...localSuggestions, ...remoteSuggestions];
+    const seen = new Set();
+    const out = [];
+    for (const item of merged) {
+      const key = `${String(item?.nom ?? "").trim().toLowerCase()}|${String(
+        item?.principeActif ?? ""
+      )
+        .trim()
+        .toLowerCase()}|${String(item?.dosage ?? "")
+        .trim()
+        .toLowerCase()}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+      if (out.length >= 10) break;
+    }
+    return out;
+  }, [localSuggestions, remoteSuggestions]);
 
   useEffect(() => {
     function onDocClick(e) {
@@ -110,13 +194,14 @@ export default function AddMedicamentPage() {
       });
       const med = payload?.medicament;
       const candidateName = med?.nom || payload?.querySuggestion || "";
+      const parsed = splitCommercialNameAndDosage(candidateName, med?.dosage);
       const safeName =
-        candidateName && !isBarcodeLike(candidateName) ? candidateName : "";
+        parsed.nom && !isBarcodeLike(parsed.nom) ? parsed.nom : "";
       setForm((f) => ({
         ...f,
         nom: safeName || f.nom,
         principeActif: med?.principeActif || f.principeActif,
-        dosage: med?.dosage || f.dosage,
+        dosage: parsed.dosage || f.dosage,
       }));
       setMsg({
         type: "ok",
@@ -144,12 +229,13 @@ export default function AddMedicamentPage() {
       });
 
       const med = payload?.medicament;
-      const isConfident =
-        Number(payload?.confidence ?? 0) >= 0.55 &&
-        isLikelyMedicationName(med?.nom) &&
-        String(med?.dosage ?? "").trim().length >= 2;
+      const confidence = Number(payload?.confidence ?? 0);
+      const hasReliableName = isLikelyMedicationName(med?.nom);
+      const hasDosage = String(med?.dosage ?? "").trim().length >= 2;
+      const hasPrinciple = String(med?.principeActif ?? "").trim().length >= 3;
+      const isUsable = hasReliableName && confidence >= 0.5 && (hasDosage || hasPrinciple);
 
-      if (med && isConfident) {
+      if (med && isUsable) {
         setForm((f) => ({
           ...f,
           nom: med.nom || f.nom,
@@ -182,7 +268,7 @@ export default function AddMedicamentPage() {
         type: "err",
         text:
           err?.message ||
-          "Analyse impossible. Vérifiez la clé Vision API et réessayez.",
+          "Analyse OCR impossible. Vérifiez la netteté/lumière puis réessayez.",
       });
       return false;
     }
@@ -191,9 +277,9 @@ export default function AddMedicamentPage() {
   function applySuggestion(m) {
     setForm((f) => ({
       ...f,
-      nom: m.nom,
-      principeActif: m.principeActif,
-      dosage: m.dosage,
+      nom: m.nom || f.nom,
+      principeActif: m.principeActif || f.principeActif,
+      dosage: m.dosage || f.dosage,
     }));
     setSuggestOpen(false);
     setMsg({
@@ -223,7 +309,16 @@ export default function AddMedicamentPage() {
         }),
       });
       setMsg({ type: "ok", text: "Médicament enregistré." });
-      setForm(empty);
+      setForm((prev) =>
+        keepCoreFields
+          ? {
+              ...empty,
+              nom: prev.nom,
+              principeActif: prev.principeActif,
+              dosage: prev.dosage,
+            }
+          : empty
+      );
       const list = await apiFetch("/medicaments");
       if (Array.isArray(list)) setCatalog(list);
     } catch (err) {
@@ -253,7 +348,7 @@ export default function AddMedicamentPage() {
 
       <form
         onSubmit={handleSubmit}
-        className="max-w-lg space-y-4 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"
+        className="w-full max-w-lg space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6"
       >
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <button
@@ -315,19 +410,24 @@ export default function AddMedicamentPage() {
               setSuggestOpen(true);
             }}
             onFocus={() => setSuggestOpen(true)}
-            placeholder="Ex. Doliprane 1000 ou chiffres du code-barres"
+            placeholder="Ex. Doliprane 1000"
           />
-          {suggestOpen && suggestions.length > 0 && (
+          {suggestOpen && (suggestions.length > 0 || suggestLoading) && (
             <ul
               ref={suggestRef}
               className="absolute z-10 mt-1 max-h-56 w-full overflow-auto rounded-lg border border-slate-200 bg-white py-1 shadow-lg"
               role="listbox"
             >
               <li className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
-                Déjà dans le stock (reprise rapide)
+                Suggestions stock + API
               </li>
+              {suggestLoading && (
+                <li className="px-3 py-2 text-xs text-slate-500">
+                  Chargement des suggestions…
+                </li>
+              )}
               {suggestions.map((m) => (
-                <li key={m.id}>
+                <li key={`${m.id ?? "api"}-${m.nom}-${m.dosage ?? ""}`}>
                   <button
                     type="button"
                     className="w-full px-3 py-2 text-left text-sm hover:bg-clinic-50"
@@ -335,7 +435,9 @@ export default function AddMedicamentPage() {
                   >
                     <span className="font-medium text-slate-900">{m.nom}</span>
                     <span className="block text-xs text-slate-500">
-                      {m.principeActif} · {m.dosage}
+                      {m.principeActif || "Principe actif non précisé"}
+                      {m.dosage ? ` · ${m.dosage}` : ""}
+                      {m.source === "local" ? " · Local" : " · Suggestion API"}
                     </span>
                   </button>
                 </li>
@@ -367,7 +469,7 @@ export default function AddMedicamentPage() {
             placeholder="Ex. 1 g"
           />
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <label className="block text-xs font-medium text-slate-600 mb-1">
               Quantité *
@@ -405,6 +507,19 @@ export default function AddMedicamentPage() {
             onChange={(e) => update("dateExpiration", e.target.value)}
           />
         </div>
+
+        <label className="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+          <input
+            type="checkbox"
+            checked={keepCoreFields}
+            onChange={(e) => setKeepCoreFields(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Garder nom + principe actif + dosage après enregistrement (ajout rapide
+            de plusieurs lots/dosages proches).
+          </span>
+        </label>
 
         {msg.text && (
           <p

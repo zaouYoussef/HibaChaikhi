@@ -86,6 +86,41 @@ function extractDosageCandidates(text) {
   return [...String(text).matchAll(rx)].map((m) => cleanText(m[0]));
 }
 
+function splitNameAndDosage(rawLine) {
+  const line = cleanText(rawLine);
+  if (!line) return { nom: "", dosage: "" };
+  const dosage =
+    extractDosageCandidates(line)[0] ||
+    cleanText(
+      line.match(/\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%)\b/i)?.[0]
+    );
+  if (!dosage) return { nom: line, dosage: "" };
+  const idx = line.toLowerCase().indexOf(dosage.toLowerCase());
+  if (idx <= 0) return { nom: line, dosage };
+  const nom = cleanText(line.slice(0, idx)).replace(/[-,;:\s]+$/g, "");
+  return { nom, dosage };
+}
+
+function pickBestMedicationLine(ocrText) {
+  const lines = normalizeOcrLines(ocrText);
+  const filtered = lines
+    .filter((line) => /[a-zA-Z]/.test(line))
+    .filter((line) => !/notice|posologie|composition|lot|exp|péremption|fabricant/i.test(line))
+    .map((line) => {
+      const hasDosage = extractDosageCandidates(line).length > 0;
+      const words = line.split(/\s+/).filter(Boolean).length;
+      const looksUpper = /[A-Z]{3,}/.test(line);
+      let score = 0;
+      if (hasDosage) score += 8;
+      if (looksUpper) score += 2;
+      if (words >= 1 && words <= 8) score += 2;
+      if (line.length >= 4 && line.length <= 80) score += 2;
+      return { line, score };
+    })
+    .sort((a, b) => b.score - a.score);
+  return filtered[0]?.line || "";
+}
+
 function extractJsonObject(text) {
   const raw = String(text ?? "").trim();
   if (!raw) return null;
@@ -416,6 +451,8 @@ async function inferMedicationFromOcrText(ocrText) {
   const normalizedOcr = normalizeForMatch(ocrText);
   const ocrTokens = new Set(tokenize(ocrText));
   const dosageCandidates = extractDosageCandidates(ocrText).map(normalizeForMatch);
+  const bestLine = pickBestMedicationLine(ocrText);
+  const parsedLine = splitNameAndDosage(bestLine);
   const meds = await prisma.medicament.findMany({
     select: { id: true, nom: true, principeActif: true, dosage: true },
   });
@@ -485,6 +522,22 @@ async function inferMedicationFromOcrText(ocrText) {
             "Principe actif détecté via OCR. Vérifiez le dosage avant enregistrement.",
         };
       }
+    }
+
+    if (parsedLine.nom && isLikelyMedicationName(parsedLine.nom)) {
+      return {
+        status: "partial",
+        confidence: parsedLine.dosage ? 0.66 : 0.58,
+        medicament: {
+          nom: parsedLine.nom,
+          principeActif: matchedPrincipes[0] || "",
+          dosage: parsedLine.dosage || "",
+          source: "vision_ocr_freeform",
+        },
+        equivalents: [],
+        message:
+          "Nom détecté via OCR local. Vérifiez/corrigez le principe actif et le dosage si nécessaire.",
+      };
     }
 
     return {
@@ -590,7 +643,7 @@ async function fetchMedicamentsMoroccoByBarcode(barcode) {
 
     return {
       nom,
-      principeActif: principeActif || "Principe actif non renseigné",
+      principeActif,
       dosage: presentation || "",
       source: "medicaments_morocco",
     };
@@ -712,12 +765,34 @@ router.post("/", async (req, res) => {
 
   const moroccoApi = await fetchMedicamentsMoroccoByBarcode(code);
   if (moroccoApi) {
+    const needsEnrichment =
+      !cleanText(moroccoApi.principeActif) || !cleanText(moroccoApi.dosage);
+    let merged = { ...moroccoApi };
+
+    if (needsEnrichment) {
+      const dataGovFallback = await fetchDataGovMaByBarcode(code);
+      if (dataGovFallback) {
+        merged = {
+          ...merged,
+          principeActif: cleanText(merged.principeActif) || dataGovFallback.principeActif,
+          dosage: cleanText(merged.dosage) || dataGovFallback.dosage,
+          source: "medicaments_morocco+data_gov_ma",
+        };
+      }
+    }
+
     return res.json({
       status: "external",
       code_barre: code,
-      querySuggestion: moroccoApi.nom,
-      medicament: moroccoApi,
-      message: "Résultat récupéré via medicament.ma",
+      querySuggestion: merged.nom,
+      medicament: {
+        ...merged,
+        principeActif:
+          cleanText(merged.principeActif) || "Principe actif non renseigné",
+      },
+      message: needsEnrichment
+        ? "Résultat récupéré via medicament.ma (complété si possible par data.gov.ma)"
+        : "Résultat récupéré via medicament.ma",
     });
   }
 
@@ -757,30 +832,28 @@ router.post("/image", async (req, res) => {
       payloadLength: String(parsed.data?.imageBase64 ?? "").length,
     });
     let ocrText = "";
-    let inferred = await extractMedicationWithVisionApi(parsed.data.imageBase64, log);
-    if (!inferred) {
-      log("fallback_to_ocr");
-      ocrText = await readTextFromBase64Image(parsed.data.imageBase64, log);
-      if (!ocrText) {
-        log("failure_no_text_detected", { elapsedMs: Date.now() - startedAt });
-        return res.json({
-          status: "not_found",
-          confidence: 0,
-          medicament: null,
-          equivalents: [],
-          message:
-            "Aucun texte lisible détecté. Essayez une image plus nette ou activez l'API Vision IA.",
-        });
-      }
-      inferred = await inferMedicationFromOcrText(ocrText);
-      log("ocr_inference_done", {
-        status: inferred?.status,
-        confidence: inferred?.confidence,
-        hasMedicament: Boolean(inferred?.medicament),
+    // Mode 100% gratuit: OCR local prioritaire (sans dépendre de Gemini).
+    ocrText = await readTextFromBase64Image(parsed.data.imageBase64, log);
+    if (!ocrText) {
+      log("failure_no_text_detected", { elapsedMs: Date.now() - startedAt });
+      return res.json({
+        status: "not_found",
+        confidence: 0,
+        medicament: null,
+        equivalents: [],
+        message:
+          "Aucun texte lisible détecté. Essayez une image plus nette (lumière + focus).",
       });
     }
+    let inferred = await inferMedicationFromOcrText(ocrText);
+    log("ocr_inference_done", {
+      status: inferred?.status,
+      confidence: inferred?.confidence,
+      hasMedicament: Boolean(inferred?.medicament),
+      bestName: inferred?.medicament?.nom,
+    });
 
-    if (!inferred?.medicament?.nom || !inferred?.medicament?.dosage) {
+    if (!inferred?.medicament?.nom) {
       log("failure_uncertain_detection", {
         confidence: inferred?.confidence,
         elapsedMs: Date.now() - startedAt,
@@ -791,7 +864,7 @@ router.post("/image", async (req, res) => {
         medicament: null,
         equivalents: [],
         message:
-          "Détection trop incertaine. Reprenez la photo plus près (nom + dosage visibles).",
+          "Détection trop incertaine. Reprenez la photo plus près (nom bien cadré).",
         ocrTextPreview: ocrText.slice(0, 240),
       });
     }

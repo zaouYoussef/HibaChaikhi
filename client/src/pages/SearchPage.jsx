@@ -126,6 +126,7 @@ export default function SearchPage() {
   }
 
   const dispo = result?.status === "disponible";
+  const equivalentDispo = result?.status === "equivalent_disponible";
 
   async function onScanDetected(decodedText) {
     const code = decodedText.trim().replace(/\s+/g, "");
@@ -162,18 +163,20 @@ export default function SearchPage() {
         Mode pharmacien rapide: recherche + délivrance en quelques secondes.
       </p>
 
-      <div className="mb-3 flex items-center gap-2">
+      <div className="mb-3">
         <button
           type="button"
           onClick={() => setScanOpen(true)}
-          className="inline-flex items-center rounded-xl border-2 border-dashed border-clinic-300 bg-clinic-50 px-4 py-2 text-sm font-semibold text-clinic-800 hover:bg-clinic-100"
+          className="inline-flex w-full items-center justify-center rounded-xl border-2 border-dashed border-clinic-300 bg-clinic-50 px-4 py-2 text-sm font-semibold text-clinic-800 hover:bg-clinic-100 sm:w-auto"
         >
           Scanner (QR / code-barres)
         </button>
-        <span className="text-xs text-slate-500">ou saisir manuellement</span>
       </div>
 
-      <form onSubmit={search} className="flex gap-2 max-w-xl mb-5">
+      <form
+        onSubmit={search}
+        className="mb-5 flex max-w-xl flex-col gap-2 sm:flex-row"
+      >
         <div className="relative flex-1">
           <input
             className="w-full rounded-xl border border-slate-200 px-4 py-3 text-sm"
@@ -219,7 +222,7 @@ export default function SearchPage() {
         <button
           type="submit"
           disabled={loading}
-          className="rounded-xl bg-clinic-600 px-5 py-3 text-sm font-semibold text-white hover:bg-clinic-700 disabled:opacity-50"
+          className="rounded-xl bg-clinic-600 px-5 py-3 text-sm font-semibold text-white hover:bg-clinic-700 disabled:opacity-50 sm:w-auto"
         >
           {loading ? "…" : "Rechercher"}
         </button>
@@ -242,6 +245,8 @@ export default function SearchPage() {
             className={`rounded-2xl border-2 p-5 ${
               dispo
                 ? "border-emerald-300 bg-emerald-50/80"
+                : equivalentDispo
+                  ? "border-amber-300 bg-amber-50/80"
                 : "border-amber-300 bg-amber-50/80"
             }`}
           >
@@ -250,19 +255,33 @@ export default function SearchPage() {
                 className={`inline-flex rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide ${
                   dispo
                     ? "bg-emerald-600 text-white"
-                    : "bg-amber-600 text-white"
+                    : equivalentDispo
+                      ? "bg-amber-600 text-white"
+                      : "bg-amber-600 text-white"
                 }`}
               >
-                {dispo ? "Disponible" : "Non dispo"}
+                {dispo ? "Disponible" : equivalentDispo ? "Équivalent dispo" : "Non dispo"}
               </span>
             </div>
 
-            {dispo && result.recommended && (
+            {(dispo || equivalentDispo) && result.recommended && (
               <>
-                <p className="text-sm font-semibold text-emerald-900 mb-2">
-                  Lot à délivrer en priorité (expiration la plus proche)
+                <p
+                  className={`mb-2 text-sm font-semibold ${
+                    equivalentDispo ? "text-amber-900" : "text-emerald-900"
+                  }`}
+                >
+                  {equivalentDispo
+                    ? "Médicament demandé absent: équivalent à délivrer en priorité"
+                    : "Lot à délivrer en priorité (expiration la plus proche)"}
                 </p>
-                <div className="rounded-xl bg-white border border-emerald-200 p-4">
+                <div
+                  className={`rounded-xl bg-white p-4 ${
+                    equivalentDispo
+                      ? "border border-amber-200"
+                      : "border border-emerald-200"
+                  }`}
+                >
                   <p className="font-bold text-slate-900">
                     {result.recommended.nom}
                   </p>
@@ -289,7 +308,11 @@ export default function SearchPage() {
                   <button
                     type="button"
                     onClick={() => deliver(result.recommended.id)}
-                    className="mt-4 w-full rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+                    className={`mt-4 w-full rounded-lg px-4 py-2.5 text-sm font-semibold text-white ${
+                      equivalentDispo
+                        ? "bg-amber-600 hover:bg-amber-700"
+                        : "bg-emerald-600 hover:bg-emerald-700"
+                    }`}
                   >
                     Donner 1 unité
                   </button>
@@ -297,22 +320,30 @@ export default function SearchPage() {
               </>
             )}
 
-            {!dispo && (
+            {!dispo && !equivalentDispo && (
               <p className="text-lg font-semibold text-amber-900">
                 {result.message || "Médicament non disponible"}
               </p>
             )}
 
-            {dispo && result.items && result.items.length > 1 && (
+            {(dispo || equivalentDispo) && result.items && result.items.length > 1 && (
               <div className="mt-4">
-                <p className="text-xs font-medium text-emerald-800 mb-2">
-                  Autres lots disponibles (triés par expiration)
+                <p
+                  className={`mb-2 text-xs font-medium ${
+                    equivalentDispo ? "text-amber-800" : "text-emerald-800"
+                  }`}
+                >
+                  {equivalentDispo
+                    ? "Autres lots d'équivalents disponibles"
+                    : "Autres lots disponibles (triés par expiration)"}
                 </p>
                 <ul className="space-y-2">
                   {result.items.slice(1).map((it) => (
                     <li
                       key={it.id}
-                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white/80 border border-emerald-100 px-3 py-2 text-sm"
+                      className={`flex flex-col items-start gap-1 rounded-lg bg-white/80 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between ${
+                        equivalentDispo ? "border border-amber-100" : "border border-emerald-100"
+                      }`}
                     >
                       <span>{it.nom}</span>
                       <span className="text-slate-600">
