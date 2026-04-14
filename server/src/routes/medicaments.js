@@ -73,6 +73,10 @@ function normalizeText(input) {
     .trim();
 }
 
+function uniqCompact(values) {
+  return [...new Set(values.map((v) => String(v ?? "").trim()).filter(Boolean))];
+}
+
 function levenshtein(a, b) {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -121,33 +125,65 @@ function buildSuggestionKey(item) {
 function buildQueryCandidates(query) {
   const original = String(query ?? "").trim();
   const normalized = normalizeText(original);
-  const set = new Set([original]);
+  return uniqCompact([original, normalized]);
+}
 
-  const synonymMap = [
-    { fr: "vitamine c", terms: ["vitamin c", "ascorbic acid"] },
-    { fr: "vit c", terms: ["vitamin c", "ascorbic acid"] },
-    { fr: "paracetamol", terms: ["acetaminophen"] },
-    { fr: "cetirizine", terms: ["cetirizine hydrochloride"] },
-    { fr: "desloratadine", terms: ["desloratadine"] },
-    { fr: "ibuprofene", terms: ["ibuprofen"] },
-    { fr: "amoxicilline", terms: ["amoxicillin"] },
-    { fr: "omeprazole", terms: ["omeprazole"] },
-  ];
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  return [];
+}
 
-  for (const row of synonymMap) {
-    if (normalized.includes(row.fr)) {
-      for (const term of row.terms) set.add(term);
+async function fetchRxNormTermCandidates(query, signal) {
+  const terms = [];
+  try {
+    const spellingUrl = `https://rxnav.nlm.nih.gov/REST/spellingsuggestions.json?name=${encodeURIComponent(
+      query
+    )}`;
+    const spellingRes = await fetch(spellingUrl, { signal });
+    if (spellingRes.ok) {
+      const spellingBody = await spellingRes.json();
+      const suggestions = toArray(
+        spellingBody?.suggestionGroup?.suggestionList?.suggestion
+      );
+      terms.push(...suggestions);
     }
+  } catch {
+    // Ignore this API branch and continue with remaining sources.
   }
 
-  if (normalized.startsWith("vitamine ")) {
-    const maybeLetter = normalized.replace("vitamine ", "").trim();
-    if (maybeLetter.length <= 3) {
-      set.add(`vitamin ${maybeLetter.toUpperCase()}`);
+  try {
+    const approxUrl = `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(
+      query
+    )}&maxEntries=8`;
+    const approxRes = await fetch(approxUrl, { signal });
+    if (approxRes.ok) {
+      const approxBody = await approxRes.json();
+      const candidates = approxBody?.approximateGroup?.candidate ?? [];
+      for (const candidate of candidates) {
+        const term = String(candidate?.rxstring ?? "").trim();
+        if (term) terms.push(term);
+        const rxcui = String(candidate?.rxcui ?? "").trim();
+        if (!rxcui) continue;
+        try {
+          const propsUrl = `https://rxnav.nlm.nih.gov/REST/rxcui/${encodeURIComponent(
+            rxcui
+          )}/properties.json`;
+          const propsRes = await fetch(propsUrl, { signal });
+          if (!propsRes.ok) continue;
+          const propsBody = await propsRes.json();
+          const name = String(propsBody?.properties?.name ?? "").trim();
+          if (name) terms.push(name);
+        } catch {
+          // Ignore single-candidate lookup errors.
+        }
+      }
     }
+  } catch {
+    // Ignore this API branch and continue with remaining sources.
   }
 
-  return [...set].filter(Boolean);
+  return uniqCompact(terms);
 }
 
 function isValidEquivalentName(value) {
@@ -160,15 +196,14 @@ function isValidEquivalentName(value) {
 }
 
 async function fetchRxNormSuggestions(query) {
-  const nq = normalizeText(query);
-  const queryCandidates = buildQueryCandidates(query);
-  if (nq.startsWith("parac") || nq.startsWith("dolipr") || nq.startsWith("dafal")) {
-    queryCandidates.push("acetaminophen", "paracetamol");
-  }
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
+    const queryCandidates = uniqCompact([
+      ...buildQueryCandidates(query),
+      ...(await fetchRxNormTermCandidates(query, controller.signal)),
+    ]).slice(0, 10);
+
     const names = [];
     for (const candidate of queryCandidates) {
       const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(candidate)}`;
@@ -185,9 +220,7 @@ async function fetchRxNormSuggestions(query) {
 
     return names
       .map((drug) => {
-        const rawName = String(drug ?? "")
-          .replace(/acetaminophen/gi, "paracetamol")
-          .trim();
+        const rawName = String(drug ?? "").trim();
         if (!rawName) return null;
         if (rawName.startsWith("{")) return null;
         if (/\bpack\b/i.test(rawName)) return null;
@@ -213,20 +246,62 @@ async function fetchRxNormSuggestions(query) {
   }
 }
 
-export async function suggestMedicaments(req, res) {
-  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
-  if (q.length < 2) {
-    return res.json({ query: q, items: [] });
-  }
+async function fetchOpenFdaSuggestions(query) {
+  const trimmed = String(query ?? "").trim();
+  if (!trimmed) return [];
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const escaped = trimmed.replace(/"/g, '\\"');
+    const searches = [
+      `openfda.brand_name:${escaped}*`,
+      `openfda.generic_name:${escaped}*`,
+    ];
+    const items = [];
+
+    for (const search of searches) {
+      const url = `https://api.fda.gov/drug/label.json?search=${encodeURIComponent(
+        search
+      )}&limit=8`;
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) continue;
+      const body = await res.json();
+      const results = Array.isArray(body?.results) ? body.results : [];
+      for (const row of results) {
+        const brand = String(row?.openfda?.brand_name?.[0] ?? "").trim();
+        const generic = String(row?.openfda?.generic_name?.[0] ?? "").trim();
+        const nom = brand || generic;
+        if (!nom) continue;
+        items.push({
+          nom,
+          dosage: "",
+          principeActif: generic || brand,
+          source: "openfda",
+        });
+      }
+    }
+
+    return items;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchLocalAndReferenceSuggestions(query) {
+  const candidates = uniqCompact([query, ...buildQueryCandidates(query)]).slice(0, 8);
   const localRows = await prisma.medicament.findMany({
     where: {
-      OR: [{ nom: containsInsensitive(q) }, { principeActif: containsInsensitive(q) }],
+      OR: candidates.flatMap((candidate) => [
+        { nom: containsInsensitive(candidate) },
+        { principeActif: containsInsensitive(candidate) },
+      ]),
     },
     orderBy: { nom: "asc" },
-    take: 8,
+    take: 20,
   });
-
   const localSuggestions = localRows.map((m) => ({
     nom: m.nom,
     dosage: m.dosage,
@@ -236,13 +311,13 @@ export async function suggestMedicaments(req, res) {
 
   const eqRows = await prisma.equivalent.findMany({
     where: {
-      OR: [
-        { nomMedicament: containsInsensitive(q) },
-        { principeActif: containsInsensitive(q) },
-      ],
+      OR: candidates.flatMap((candidate) => [
+        { nomMedicament: containsInsensitive(candidate) },
+        { principeActif: containsInsensitive(candidate) },
+      ]),
     },
     orderBy: { nomMedicament: "asc" },
-    take: 8,
+    take: 20,
   });
   const referenceSuggestions = eqRows.map((e) => ({
     nom: e.nomMedicament,
@@ -251,11 +326,25 @@ export async function suggestMedicaments(req, res) {
     source: "reference",
   }));
 
+  return { localSuggestions, referenceSuggestions };
+}
+
+export async function suggestMedicaments(req, res) {
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (q.length < 2) {
+    return res.json({ query: q, items: [] });
+  }
+
+  const { localSuggestions, referenceSuggestions } =
+    await fetchLocalAndReferenceSuggestions(q);
+
   const externalSuggestions = await fetchRxNormSuggestions(q);
+  const openFdaSuggestions = await fetchOpenFdaSuggestions(q);
   const merged = [
     ...localSuggestions,
     ...referenceSuggestions,
     ...externalSuggestions,
+    ...openFdaSuggestions,
   ];
   const seen = new Set();
   const items = [];
@@ -275,21 +364,10 @@ export async function autocompleteMedicaments(req, res) {
   const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
   if (q.length < 2) return res.json([]);
   const { items } = await (async () => {
-    const localRows = await prisma.medicament.findMany({
-      where: {
-        OR: [{ nom: containsInsensitive(q) }, { principeActif: containsInsensitive(q) }],
-      },
-      orderBy: { nom: "asc" },
-      take: 8,
-    });
-    const localSuggestions = localRows.map((m) => ({
-      nom: m.nom,
-      dosage: m.dosage,
-      principeActif: m.principeActif,
-      source: "local",
-    }));
+    const { localSuggestions } = await fetchLocalAndReferenceSuggestions(q);
     const externalSuggestions = await fetchRxNormSuggestions(q);
-    const merged = [...localSuggestions, ...externalSuggestions];
+    const openFdaSuggestions = await fetchOpenFdaSuggestions(q);
+    const merged = [...localSuggestions, ...externalSuggestions, ...openFdaSuggestions];
     const seen = new Set();
     const deduped = [];
     for (const row of merged) {

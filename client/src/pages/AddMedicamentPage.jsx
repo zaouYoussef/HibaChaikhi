@@ -407,7 +407,7 @@ export default function AddMedicamentPage() {
             onFocus={() => setSuggestOpen(true)}
             placeholder="Ex. Doliprane 1000"
           />
-          {suggestOpen && (suggestions.length > 0 || suggestLoading) && (
+          {suggestOpen && form.nom.trim().length >= 2 && (
             <ul
               ref={suggestRef}
               className="absolute z-10 mt-1 max-h-56 w-full overflow-auto rounded-lg border border-slate-200 bg-white py-1 shadow-lg"
@@ -419,6 +419,11 @@ export default function AddMedicamentPage() {
               {suggestLoading && (
                 <li className="px-3 py-2 text-xs text-slate-500">
                   Chargement des suggestions…
+                </li>
+              )}
+              {!suggestLoading && suggestions.length === 0 && (
+                <li className="px-3 py-2 text-xs text-slate-500">
+                  Aucune suggestion pour cette saisie.
                 </li>
               )}
               {suggestions.map((m) => (
