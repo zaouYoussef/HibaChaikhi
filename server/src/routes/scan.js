@@ -323,6 +323,16 @@ function dedupeEquivalentItems(items) {
   return out;
 }
 
+function isValidEquivalentName(name) {
+  const value = cleanText(name);
+  if (!value) return false;
+  if (value.length < 3 || value.length > 120) return false;
+  if (value.includes("{") || value.includes("}")) return false;
+  if (/\bpack\b/i.test(value)) return false;
+  if (value.split("/").length > 2) return false;
+  return true;
+}
+
 async function fetchRxNormWebEquivalents({ nom, principeActif }) {
   const query = cleanText(principeActif || nom);
   if (query.length < 2) return [];
@@ -360,6 +370,7 @@ async function fetchRxNormWebEquivalents({ nom, principeActif }) {
           source: "rxnorm_web",
         };
       })
+      .filter((row) => isValidEquivalentName(row.nom))
       .filter((row) => normalizeText(row.nom) !== normalizeText(nom))
       .slice(0, 10);
     return dedupeEquivalentItems(results);

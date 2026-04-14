@@ -114,6 +114,15 @@ function buildSuggestionKey(item) {
   return `${normalizeText(item.nom)}|${normalizeText(item.dosage)}|${normalizeText(item.principeActif)}`;
 }
 
+function isValidEquivalentName(value) {
+  const name = String(value ?? "").trim();
+  if (!name) return false;
+  if (name.includes("{") || name.includes("}")) return false;
+  if (/\bpack\b/i.test(name)) return false;
+  if (name.split("/").length > 2) return false;
+  return true;
+}
+
 async function fetchRxNormSuggestions(query) {
   const nq = normalizeText(query);
   const queryCandidates = [query];
@@ -292,7 +301,7 @@ export async function searchMedicaments(req, res) {
       OR: [{ nomMedicament: pattern }, { principeActif: pattern }],
     },
   });
-  for (const e of equivByName) {
+  for (const e of equivByName.filter((row) => isValidEquivalentName(row.nomMedicament))) {
     principles.add(e.principeActif.trim());
   }
 
@@ -320,6 +329,7 @@ export async function searchMedicaments(req, res) {
       },
     });
   }
+  equivRefs = equivRefs.filter((row) => isValidEquivalentName(row.nomMedicament));
 
   const seen = new Set();
   const equivalents = [];
