@@ -368,6 +368,138 @@ function isValidEquivalentName(name) {
   return true;
 }
 
+function looksUnknownPrinciple(value) {
+  const v = normalizeText(value);
+  if (!v) return true;
+  return (
+    v.includes("non renseigne") ||
+    v.includes("non renseigné") ||
+    v.includes("inconnu")
+  );
+}
+
+function normalizeDosageToken(value) {
+  return cleanText(value).replace(/\s+/g, "").toLowerCase();
+}
+
+function splitNameAndStrength(value) {
+  const raw = cleanText(value);
+  if (!raw) return { name: "", dosage: "" };
+  const dosage = extractDosageCandidates(raw)[0] || "";
+  if (!dosage) return { name: raw, dosage: "" };
+  const idx = raw.toLowerCase().indexOf(dosage.toLowerCase());
+  if (idx <= 0) return { name: raw, dosage };
+  return {
+    name: cleanText(raw.slice(0, idx)).replace(/[-,;:\s]+$/g, ""),
+    dosage,
+  };
+}
+
+async function fetchPrincipleFromRxNorm({ nom, dosage }) {
+  const query = cleanText(nom);
+  if (query.length < 2) return "";
+  const dosageToken = normalizeDosageToken(dosage);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return "";
+    const body = await res.json();
+    const groups = body?.drugGroup?.conceptGroup ?? [];
+    const concepts = groups.flatMap((g) => g?.conceptProperties ?? []);
+    let fallback = "";
+    for (const concept of concepts) {
+      const label = cleanText(concept?.name);
+      if (!label) continue;
+      const parsed = splitNameAndStrength(label);
+      const candidatePrinciple = cleanText(parsed.name);
+      if (!candidatePrinciple) continue;
+      if (!fallback) fallback = candidatePrinciple;
+      if (!dosageToken) return candidatePrinciple;
+      if (
+        normalizeDosageToken(parsed.dosage) === dosageToken ||
+        normalizeText(label).includes(normalizeText(dosage))
+      ) {
+        return candidatePrinciple;
+      }
+    }
+    return fallback;
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchPrincipleFromOpenFda({ nom }) {
+  const query = cleanText(nom);
+  if (query.length < 2) return "";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const escaped = query.replace(/"/g, '\\"');
+    const searches = [
+      `openfda.brand_name:"${escaped}"`,
+      `openfda.brand_name:${escaped}*`,
+      `openfda.generic_name:${escaped}*`,
+    ];
+    for (const search of searches) {
+      const url = `https://api.fda.gov/drug/label.json?search=${encodeURIComponent(
+        search
+      )}&limit=3`;
+      // eslint-disable-next-line no-await-in-loop
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const body = await res.json();
+      const rows = Array.isArray(body?.results) ? body.results : [];
+      for (const row of rows) {
+        const pa = cleanText(row?.openfda?.generic_name?.[0]);
+        if (pa) return pa;
+        const substances = row?.active_ingredient;
+        if (Array.isArray(substances) && substances.length > 0) {
+          const first = splitNameAndStrength(substances[0]);
+          if (first.name) return first.name;
+        }
+      }
+    }
+    return "";
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function enrichPrincipleFromWeb(medicament) {
+  const current = cleanText(medicament?.principeActif);
+  if (current && !looksUnknownPrinciple(current)) {
+    return medicament;
+  }
+  const nom = cleanText(medicament?.nom);
+  const dosage = cleanText(medicament?.dosage);
+  if (!nom) return medicament;
+
+  const fromRxNorm = await fetchPrincipleFromRxNorm({ nom, dosage });
+  if (fromRxNorm) {
+    return {
+      ...medicament,
+      principeActif: fromRxNorm,
+      source: `${medicament?.source || "external"}+rxnorm_pa`,
+    };
+  }
+  const fromOpenFda = await fetchPrincipleFromOpenFda({ nom });
+  if (fromOpenFda) {
+    return {
+      ...medicament,
+      principeActif: fromOpenFda,
+      source: `${medicament?.source || "external"}+openfda_pa`,
+    };
+  }
+  return medicament;
+}
+
 async function fetchRxNormWebEquivalents({ nom, principeActif }) {
   const query = cleanText(principeActif || nom);
   if (query.length < 2) return [];
@@ -426,6 +558,43 @@ async function getOcrWorker() {
   return ocrWorkerPromise;
 }
 
+function buildTextFromWords(words, minConfidence) {
+  const kept = (words ?? [])
+    .filter((w) => Number(w?.confidence ?? 0) >= minConfidence)
+    .sort((a, b) => {
+      const byLine = Number(a?.line_num ?? 0) - Number(b?.line_num ?? 0);
+      if (byLine !== 0) return byLine;
+      return Number(a?.word_num ?? 0) - Number(b?.word_num ?? 0);
+    });
+  const lines = new Map();
+  for (const w of kept) {
+    const key = `${w?.block_num ?? 0}-${w?.par_num ?? 0}-${w?.line_num ?? 0}`;
+    const value = cleanText(w?.text);
+    if (!value) continue;
+    if (!lines.has(key)) lines.set(key, []);
+    lines.get(key).push(value);
+  }
+  return cleanText(
+    [...lines.values()]
+      .map((parts) => parts.join(" "))
+      .join("\n")
+  );
+}
+
+function scoreOcrText(text, avgConfidence) {
+  const normalized = cleanText(text);
+  if (!normalized) return 0;
+  const hasDosage = extractDosageCandidates(normalized).length > 0;
+  const alphaCount = (normalized.match(/[a-zA-Z]/g) ?? []).length;
+  const digitCount = (normalized.match(/\d/g) ?? []).length;
+  let score = Number(avgConfidence || 0);
+  if (hasDosage) score += 25;
+  if (alphaCount >= 10) score += 10;
+  if (digitCount >= 2) score += 5;
+  if (normalized.length >= 18) score += 6;
+  return score;
+}
+
 async function readTextFromBase64Image(imageBase64, log = () => {}) {
   const { base64Data: cleanBase64, dataUrl } = splitDataUrl(imageBase64);
   if (!cleanBase64) {
@@ -439,12 +608,42 @@ async function readTextFromBase64Image(imageBase64, log = () => {}) {
   }
   log("ocr_request_start", { estimatedBytes });
   const worker = await getOcrWorker();
-  const {
-    data: { text },
-  } = await worker.recognize(dataUrl);
-  const cleaned = cleanText(text);
-  log("ocr_success", { textLength: cleaned.length, preview: cleaned.slice(0, 120) });
-  return cleaned;
+  const minWordConfidence = Number(process.env.OCR_WORD_CONFIDENCE || 55);
+  const passes = [
+    { psm: "11", preserve_interword_spaces: "1" }, // sparse text
+    { psm: "6", preserve_interword_spaces: "1" }, // single uniform block
+    { psm: "4", preserve_interword_spaces: "1" }, // single column variable sizes
+  ];
+  let best = { text: "", score: 0, confidence: 0, psm: "default" };
+
+  for (const pass of passes) {
+    // eslint-disable-next-line no-await-in-loop
+    await worker.setParameters(pass);
+    // eslint-disable-next-line no-await-in-loop
+    const { data } = await worker.recognize(dataUrl);
+    const byWords = buildTextFromWords(data?.words, minWordConfidence);
+    const merged = cleanText(byWords || data?.text);
+    const avgConfidence = Number(data?.confidence ?? 0);
+    const score = scoreOcrText(merged, avgConfidence);
+    log("ocr_pass_done", {
+      psm: pass.psm,
+      avgConfidence,
+      textLength: merged.length,
+      score,
+      preview: merged.slice(0, 120),
+    });
+    if (score > best.score) {
+      best = { text: merged, score, confidence: avgConfidence, psm: pass.psm };
+    }
+  }
+
+  log("ocr_success", {
+    textLength: best.text.length,
+    confidence: best.confidence,
+    psm: best.psm,
+    preview: best.text.slice(0, 120),
+  });
+  return best.text;
 }
 
 async function inferMedicationFromOcrText(ocrText) {
@@ -781,14 +980,15 @@ router.post("/", async (req, res) => {
       }
     }
 
+    const enriched = await enrichPrincipleFromWeb(merged);
     return res.json({
       status: "external",
       code_barre: code,
-      querySuggestion: merged.nom,
+      querySuggestion: enriched.nom,
       medicament: {
-        ...merged,
+        ...enriched,
         principeActif:
-          cleanText(merged.principeActif) || "Principe actif non renseigné",
+          cleanText(enriched.principeActif) || "Principe actif non renseigné",
       },
       message: needsEnrichment
         ? "Résultat récupéré via medicament.ma (complété si possible par data.gov.ma)"
@@ -798,11 +998,12 @@ router.post("/", async (req, res) => {
 
   const dataGovApi = await fetchDataGovMaByBarcode(code);
   if (dataGovApi) {
+    const enriched = await enrichPrincipleFromWeb(dataGovApi);
     return res.json({
       status: "external",
       code_barre: code,
-      querySuggestion: dataGovApi.nom,
-      medicament: dataGovApi,
+      querySuggestion: enriched.nom,
+      medicament: enriched,
       message: "Résultat récupéré via data.gov.ma",
     });
   }
@@ -846,6 +1047,31 @@ router.post("/image", async (req, res) => {
       });
     }
     let inferred = await inferMedicationFromOcrText(ocrText);
+    const hasReliableOcr =
+      Boolean(inferred?.medicament?.nom) && Number(inferred?.confidence ?? 0) >= 0.7;
+    if (!hasReliableOcr) {
+      const vision = await extractMedicationWithVisionApi(parsed.data.imageBase64, log);
+      if (vision?.medicament?.nom) {
+        inferred = {
+          ...vision,
+          medicament: {
+            ...vision.medicament,
+            principeActif:
+              cleanText(vision?.medicament?.principeActif) ||
+              cleanText(inferred?.medicament?.principeActif),
+            dosage:
+              cleanText(vision?.medicament?.dosage) ||
+              cleanText(inferred?.medicament?.dosage),
+          },
+        };
+      }
+    }
+    if (inferred?.medicament?.nom) {
+      inferred = {
+        ...inferred,
+        medicament: await enrichPrincipleFromWeb(inferred.medicament),
+      };
+    }
     log("ocr_inference_done", {
       status: inferred?.status,
       confidence: inferred?.confidence,

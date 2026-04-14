@@ -11,8 +11,8 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState("Initialisation caméra...");
   const [err, setErr] = useState("");
-  const MAX_AUTO_ATTEMPTS = 8;
-  const MAX_AUTO_MS = 26000;
+  const MAX_AUTO_ATTEMPTS = 14;
+  const MAX_AUTO_MS = 42000;
 
   function stopAll() {
     if (timerRef.current) {
@@ -41,8 +41,22 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
       canvas.height = Math.round(video.videoHeight * ratio);
       const ctx = canvas.getContext("2d");
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageBase64 = canvas.toDataURL("image/jpeg", 0.78);
-      const ok = await onFrameAnalyze?.(imageBase64);
+      const imageBase64 = canvas.toDataURL("image/jpeg", 0.9);
+      let ok = await onFrameAnalyze?.(imageBase64);
+      if (!ok) {
+        // Second attempt on center crop where the guide frame is shown.
+        const cropCanvas = document.createElement("canvas");
+        const cropW = Math.round(canvas.width * 0.72);
+        const cropH = Math.round(canvas.height * 0.62);
+        const sx = Math.max(0, Math.round((canvas.width - cropW) / 2));
+        const sy = Math.max(0, Math.round((canvas.height - cropH) / 2));
+        cropCanvas.width = cropW;
+        cropCanvas.height = cropH;
+        const cropCtx = cropCanvas.getContext("2d");
+        cropCtx.drawImage(canvas, sx, sy, cropW, cropH, 0, 0, cropW, cropH);
+        const croppedBase64 = cropCanvas.toDataURL("image/jpeg", 0.92);
+        ok = await onFrameAnalyze?.(croppedBase64);
+      }
       if (ok) {
         stopAll();
         return;
@@ -61,7 +75,7 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
         });
         return;
       }
-      setStatus("Analyse faite. Continuez à cadrer le médicament...");
+      setStatus("Analyse faite. Rapprochez la boîte et gardez le texte net...");
     } catch (e) {
       attemptsRef.current += 1;
       setErr(e?.message || "Analyse image impossible.");
@@ -95,6 +109,12 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
           return;
         }
         streamRef.current = stream;
+        const videoTrack = stream.getVideoTracks?.()[0];
+        if (videoTrack?.applyConstraints) {
+          videoTrack
+            .applyConstraints({ advanced: [{ focusMode: "continuous" }] })
+            .catch(() => {});
+        }
         const video = videoRef.current;
         if (!video) return;
         video.srcObject = stream;
@@ -105,7 +125,7 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
         setStatus("Pointez le médicament, lecture automatique active.");
         timerRef.current = setInterval(() => {
           analyzeCurrentFrame();
-        }, 2200);
+        }, 1600);
       } catch (e) {
         setErr(
           e?.message || "Impossible d'accéder à la caméra. Vérifiez les permissions."
@@ -124,7 +144,7 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
         <div>
           <p className="text-sm font-semibold">Lecture caméra automatique</p>
           <p className="text-xs text-white/75">
-            Cadrez le nom + dosage de la boîte. Détection toutes les 2 secondes.
+            Cadrez nom + dosage, puis rapprochez légèrement jusqu'a netteté.
           </p>
         </div>
         <button
