@@ -19,6 +19,13 @@ function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
 }
 
+function normalizeOcrLines(input) {
+  return String(input ?? "")
+    .split(/\r?\n/g)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+}
+
 function normalizeForMatch(input) {
   return cleanText(input)
     .toLowerCase()
@@ -42,6 +49,118 @@ function extractDosageCandidates(text) {
   return [...String(text).matchAll(rx)].map((m) => cleanText(m[0]));
 }
 
+function extractAfterKeyword(lines, keywords) {
+  for (const line of lines) {
+    const lowered = line.toLowerCase();
+    for (const keyword of keywords) {
+      const idx = lowered.indexOf(keyword);
+      if (idx === -1) continue;
+      const raw = line.slice(idx + keyword.length).replace(/^[:\s-]+/, "");
+      const value = cleanText(raw);
+      if (value && value.length >= 3) return value;
+    }
+  }
+  return "";
+}
+
+function guessNameFromLines(lines, dosageCandidates) {
+  const blocked = [
+    "lot",
+    "expiration",
+    "exp",
+    "péremption",
+    "fabri",
+    "code",
+    "ean",
+    "cip",
+    "prix",
+    "notice",
+    "composition",
+    "posologie",
+    "voie",
+  ];
+  const dosageRx =
+    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%))?/gi;
+
+  const scored = lines
+    .map((line) => {
+      const lowered = line.toLowerCase();
+      if (blocked.some((w) => lowered.includes(w))) return null;
+      if (/^\d{6,}$/.test(line.replace(/\s+/g, ""))) return null;
+      if (line.length < 4) return null;
+
+      let score = 0;
+      if (/[a-zA-Z]/.test(line)) score += 2;
+      if (line.length >= 8 && line.length <= 70) score += 2;
+      if (/^[A-Z0-9\s\-/+.,()%]+$/.test(line)) score += 1;
+      if (dosageRx.test(line)) score += 2;
+      dosageRx.lastIndex = 0;
+
+      const stripped = cleanText(line.replace(dosageRx, ""));
+      if (stripped.length < 3) return null;
+      if (dosageCandidates.some((d) => line.includes(d))) score += 1;
+      return { line: stripped, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.line || "";
+}
+
+function inferFreeformMedicamentFromOcrText(ocrText) {
+  const lines = normalizeOcrLines(ocrText);
+  const dosageCandidates = extractDosageCandidates(ocrText);
+  const principeActif = extractAfterKeyword(lines, [
+    "principe actif",
+    "dci",
+    "substance active",
+    "composition",
+  ]);
+  const guessedName = guessNameFromLines(lines, dosageCandidates);
+  if (!guessedName || guessedName.length < 3) return null;
+
+  const confidence = Math.min(
+    0.7,
+    Number(
+      (
+        0.3 +
+        (dosageCandidates.length ? 0.15 : 0) +
+        (principeActif ? 0.15 : 0) +
+        (lines.length >= 3 ? 0.1 : 0)
+      ).toFixed(2)
+    )
+  );
+
+  return {
+    status: "partial",
+    confidence,
+    medicament: {
+      nom: guessedName,
+      principeActif: principeActif || "",
+      dosage: dosageCandidates[0] || "",
+      source: "vision_ocr_raw",
+    },
+    equivalents: [],
+    message:
+      "Texte extrait depuis l'image. Vérifiez les champs détectés avant enregistrement.",
+  };
+}
+
+async function storeEquivalentReference(principeActif, nomMedicament) {
+  const principe = cleanText(principeActif);
+  const nom = cleanText(nomMedicament);
+  if (!principe || !nom) return false;
+  const existing = await prisma.equivalent.findFirst({
+    where: { principeActif: principe, nomMedicament: nom },
+    select: { id: true },
+  });
+  if (existing) return false;
+  await prisma.equivalent.create({
+    data: { principeActif: principe, nomMedicament: nom },
+  });
+  return true;
+}
+
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     ocrWorkerPromise = createWorker("fra+eng").catch((err) => {
@@ -53,18 +172,20 @@ async function getOcrWorker() {
 }
 
 async function readTextFromBase64Image(imageBase64) {
-  const cleanBase64 = String(imageBase64)
-    .replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, "")
-    .trim();
-  const imageBuffer = Buffer.from(cleanBase64, "base64");
-  if (!imageBuffer.length) return "";
-  if (imageBuffer.length > 4 * 1024 * 1024) {
+  const raw = String(imageBase64 || "").trim();
+  const cleanBase64 = raw.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, "");
+  if (!cleanBase64) return "";
+  const estimatedBytes = Math.floor((cleanBase64.length * 3) / 4);
+  if (estimatedBytes > 4 * 1024 * 1024) {
     throw new Error("Image trop lourde (max 4 Mo).");
   }
+  const dataUrl = raw.startsWith("data:image/")
+    ? raw
+    : `data:image/jpeg;base64,${cleanBase64}`;
   const worker = await getOcrWorker();
   const {
     data: { text },
-  } = await worker.recognize(imageBuffer);
+  } = await worker.recognize(dataUrl);
   return cleanText(text);
 }
 
@@ -107,14 +228,16 @@ async function inferMedicationFromOcrText(ocrText) {
   }
 
   if (!best || bestScore < 8) {
-    return {
+    return (
+      inferFreeformMedicamentFromOcrText(ocrText) || {
       status: "not_found",
       confidence: 0,
       medicament: null,
       equivalents: [],
       message:
         "Texte détecté mais médicament non reconnu avec confiance suffisante.",
-    };
+    }
+    );
   }
 
   const equivalentsLocal = await prisma.medicament.findMany({
@@ -221,6 +344,74 @@ async function fetchMedicamentsMoroccoByBarcode(barcode) {
   }
 }
 
+function pickFirstNonEmpty(record, keys) {
+  for (const key of keys) {
+    const value = cleanText(record?.[key]);
+    if (value) return value;
+  }
+  return "";
+}
+
+async function fetchDataGovMaByBarcode(barcode) {
+  const resourceId = process.env.DATAGOVMA_RESOURCE_ID?.trim();
+  if (!resourceId) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  const endpoint =
+    process.env.DATAGOVMA_SEARCH_URL?.trim() ||
+    "https://www.data.gov.ma/data/api/3/action/datastore_search";
+  const url = new URL(endpoint);
+  url.searchParams.set("resource_id", resourceId);
+  url.searchParams.set("q", barcode);
+  url.searchParams.set("limit", "1");
+
+  try {
+    const res = await fetch(url.toString(), { signal: controller.signal });
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const record = payload?.result?.records?.[0];
+    if (!record) return null;
+
+    const nom = pickFirstNonEmpty(record, [
+      "nom",
+      "nom_commercial",
+      "denomination",
+      "denomination_commune",
+      "specialite",
+      "medicament",
+      "libelle",
+      "produit",
+    ]);
+    const principeActif = pickFirstNonEmpty(record, [
+      "principe_actif",
+      "dci",
+      "substance_active",
+      "composition",
+      "ingredient_actif",
+    ]);
+    const dosage = pickFirstNonEmpty(record, [
+      "dosage",
+      "presentation",
+      "forme_dosage",
+      "concentration",
+      "specification",
+    ]);
+
+    if (!nom || isBarcodeLike(nom, barcode)) return null;
+    return {
+      nom,
+      principeActif: principeActif || "Principe actif non renseigné",
+      dosage,
+      source: "data_gov_ma",
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 router.post("/", async (req, res) => {
   const parsed = scanSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -273,12 +464,24 @@ router.post("/", async (req, res) => {
     });
   }
 
+  const dataGovApi = await fetchDataGovMaByBarcode(code);
+  if (dataGovApi) {
+    return res.json({
+      status: "external",
+      code_barre: code,
+      querySuggestion: dataGovApi.nom,
+      medicament: dataGovApi,
+      message: "Résultat récupéré via data.gov.ma",
+    });
+  }
+
   return res.json({
     status: "not_found",
     code_barre: code,
     querySuggestion: code,
     medicament: null,
-    message: "Aucun résultat trouvé sur medicament.ma. Utilisez la saisie manuelle.",
+    message:
+      "Aucun résultat trouvé sur medicament.ma / data.gov.ma. Utilisez la saisie manuelle.",
   });
 });
 
@@ -299,8 +502,16 @@ router.post("/image", async (req, res) => {
       });
     }
     const inferred = await inferMedicationFromOcrText(ocrText);
+    let equivalentStored = false;
+    if (inferred?.medicament?.nom && inferred?.medicament?.principeActif) {
+      equivalentStored = await storeEquivalentReference(
+        inferred.medicament.principeActif,
+        inferred.medicament.nom
+      );
+    }
     return res.json({
       ...inferred,
+      equivalentStored,
       ocrTextPreview: ocrText.slice(0, 240),
     });
   } catch (err) {

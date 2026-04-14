@@ -146,8 +146,8 @@ export default function AddMedicamentPage() {
         type: "ok",
         text:
           payload?.status === "ok"
-            ? "Médicament détecté automatiquement par la caméra."
-            : "Lecture partielle: vérifiez les champs détectés avant enregistrement.",
+            ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}`
+            : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}`,
       });
       setVisionOpen(false);
       return true;
