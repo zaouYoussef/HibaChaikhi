@@ -19,6 +19,19 @@ function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
 }
 
+function isScanDebugEnabled() {
+  return process.env.DEBUG_SCAN === "1";
+}
+
+function createScanLogger(reqId) {
+  return (event, details = {}) => {
+    if (!isScanDebugEnabled()) return;
+    const safe = { ...details };
+    if (typeof safe.apiKey === "string") delete safe.apiKey;
+    console.log(`[scan:image][${reqId}] ${event}`, safe);
+  };
+}
+
 function splitDataUrl(input) {
   const raw = String(input ?? "").trim();
   const m = raw.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
@@ -104,13 +117,14 @@ function isLikelyMedicationName(value) {
   return /[a-zA-Z]/.test(v);
 }
 
-async function extractMedicationWithVisionApi(imageBase64) {
+async function extractMedicationWithVisionApi(imageBase64, log = () => {}) {
   const apiKey = process.env.VISION_API_KEY?.trim();
   if (
     !apiKey ||
     apiKey === "TA_NOUVELLE_CLE" ||
     apiKey.toLowerCase().includes("nouvelle_cle")
   ) {
+    log("vision_skipped_invalid_key");
     return null;
   }
   const model = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
@@ -120,7 +134,22 @@ async function extractMedicationWithVisionApi(imageBase64) {
       model
     )}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const { mimeType, base64Data } = splitDataUrl(imageBase64);
-  if (!base64Data) return null;
+  if (!base64Data) {
+    log("vision_skipped_no_base64");
+    return null;
+  }
+  log("vision_request_start", {
+    model,
+    endpointHost: (() => {
+      try {
+        return new URL(endpoint).host;
+      } catch {
+        return "invalid-url";
+      }
+    })(),
+    mimeType,
+    base64Length: base64Data.length,
+  });
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
@@ -163,7 +192,14 @@ Règles strictes:
         },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      log("vision_http_error", {
+        status: res.status,
+        bodyPreview: body.slice(0, 200),
+      });
+      return null;
+    }
     const payload = await res.json();
     const text = (payload?.candidates ?? [])
       .flatMap((c) => c?.content?.parts ?? [])
@@ -171,16 +207,35 @@ Règles strictes:
       .join("\n")
       .trim();
     const parsed = extractJsonObject(text);
-    if (!parsed) return null;
+    if (!parsed) {
+      log("vision_json_parse_failed", { rawPreview: text.slice(0, 200) });
+      return null;
+    }
 
     const nom = cleanText(parsed.nom);
     const principeActif = cleanText(parsed.principeActif);
     const dosage = cleanText(parsed.dosage);
     const confidence = Number(parsed.confidence ?? 0);
 
-    if (!isLikelyMedicationName(nom)) return null;
-    if (!dosage || dosage.length < 2) return null;
-    if (!(confidence >= 0.55)) return null;
+    if (!isLikelyMedicationName(nom)) {
+      log("vision_rejected_name", { nom });
+      return null;
+    }
+    if (!dosage || dosage.length < 2) {
+      log("vision_rejected_dosage", { dosage });
+      return null;
+    }
+    if (!(confidence >= 0.55)) {
+      log("vision_rejected_confidence", { confidence });
+      return null;
+    }
+
+    log("vision_success", {
+      nom,
+      principeActif,
+      dosage,
+      confidence,
+    });
 
     return {
       status: "ok",
@@ -195,7 +250,11 @@ Règles strictes:
       message: "Médicament détecté via API Vision IA.",
       ocrTextPreview: "",
     };
-  } catch {
+  } catch (err) {
+    log("vision_exception", {
+      name: err?.name,
+      message: err?.message,
+    });
     return null;
   } finally {
     clearTimeout(timeout);
@@ -297,18 +356,25 @@ async function getOcrWorker() {
   return ocrWorkerPromise;
 }
 
-async function readTextFromBase64Image(imageBase64) {
+async function readTextFromBase64Image(imageBase64, log = () => {}) {
   const { base64Data: cleanBase64, dataUrl } = splitDataUrl(imageBase64);
-  if (!cleanBase64) return "";
+  if (!cleanBase64) {
+    log("ocr_skipped_no_base64");
+    return "";
+  }
   const estimatedBytes = Math.floor((cleanBase64.length * 3) / 4);
   if (estimatedBytes > 4 * 1024 * 1024) {
+    log("ocr_rejected_image_too_large", { estimatedBytes });
     throw new Error("Image trop lourde (max 4 Mo).");
   }
+  log("ocr_request_start", { estimatedBytes });
   const worker = await getOcrWorker();
   const {
     data: { text },
   } = await worker.recognize(dataUrl);
-  return cleanText(text);
+  const cleaned = cleanText(text);
+  log("ocr_success", { textLength: cleaned.length, preview: cleaned.slice(0, 120) });
+  return cleaned;
 }
 
 async function inferMedicationFromOcrText(ocrText) {
@@ -606,16 +672,26 @@ router.post("/", async (req, res) => {
 });
 
 router.post("/image", async (req, res) => {
+  const reqId = Math.random().toString(36).slice(2, 10);
+  const log = createScanLogger(reqId);
+  const startedAt = Date.now();
   const parsed = imageScanSchema.safeParse(req.body);
   if (!parsed.success) {
+    log("request_invalid_payload");
     return res.status(400).json({ error: parsed.error.flatten() });
   }
   try {
+    log("request_start", {
+      hasBase64: Boolean(parsed.data?.imageBase64),
+      payloadLength: String(parsed.data?.imageBase64 ?? "").length,
+    });
     let ocrText = "";
-    let inferred = await extractMedicationWithVisionApi(parsed.data.imageBase64);
+    let inferred = await extractMedicationWithVisionApi(parsed.data.imageBase64, log);
     if (!inferred) {
-      ocrText = await readTextFromBase64Image(parsed.data.imageBase64);
+      log("fallback_to_ocr");
+      ocrText = await readTextFromBase64Image(parsed.data.imageBase64, log);
       if (!ocrText) {
+        log("failure_no_text_detected", { elapsedMs: Date.now() - startedAt });
         return res.json({
           status: "not_found",
           confidence: 0,
@@ -626,9 +702,18 @@ router.post("/image", async (req, res) => {
         });
       }
       inferred = await inferMedicationFromOcrText(ocrText);
+      log("ocr_inference_done", {
+        status: inferred?.status,
+        confidence: inferred?.confidence,
+        hasMedicament: Boolean(inferred?.medicament),
+      });
     }
 
     if (!inferred?.medicament?.nom || !inferred?.medicament?.dosage) {
+      log("failure_uncertain_detection", {
+        confidence: inferred?.confidence,
+        elapsedMs: Date.now() - startedAt,
+      });
       return res.json({
         status: "not_found",
         confidence: Number(inferred?.confidence ?? 0),
@@ -650,6 +735,7 @@ router.post("/image", async (req, res) => {
         inferred.medicament.principeActif,
         inferred.medicament.nom
       );
+      log("equivalent_primary_store", { equivalentStored });
     }
     if (inferred?.medicament?.nom) {
       const webEquivalents = await fetchRxNormWebEquivalents({
@@ -667,7 +753,16 @@ router.post("/image", async (req, res) => {
           webEquivalents.map((e) => e.nom)
         );
       }
+      log("equivalents_web_merge", {
+        webCount: webEquivalents.length,
+        storedFromWeb: equivalentsStoredFromWeb,
+      });
     }
+    log("request_success", {
+      elapsedMs: Date.now() - startedAt,
+      confidence: inferred?.confidence,
+      source: inferred?.medicament?.source,
+    });
     return res.json({
       ...inferred,
       equivalents: mergedEquivalents,
@@ -676,6 +771,11 @@ router.post("/image", async (req, res) => {
       ocrTextPreview: inferred?.ocrTextPreview || ocrText.slice(0, 240),
     });
   } catch (err) {
+    log("request_exception", {
+      elapsedMs: Date.now() - startedAt,
+      name: err?.name,
+      message: err?.message,
+    });
     return res.status(500).json({
       error:
         err?.message ||
