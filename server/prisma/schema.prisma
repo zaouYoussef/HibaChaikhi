@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String           @id @default(uuid())
+  email     String           @unique
+  password  String
+  name      String?
+  createdAt DateTime         @default(now())
+  histories DispenseHistory[]
+}
+
+model Medicament {
+  id            String           @id @default(uuid())
+  nom           String
+  principeActif String
+  dosage        String
+  codeBarre     String?
+  quantite      Int              @default(0)
+  dateExpiration DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  lots          Lot[]
+  histories     DispenseHistory[]
+
+  @@index([codeBarre])
+  @@unique([nom, principeActif, dosage])
+}
+
+model Lot {
+  id             String   @id @default(uuid())
+  numeroLot      String
+  quantite       Int
+  dateExpiration DateTime
+  medicamentId   String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  medicament     Medicament @relation(fields: [medicamentId], references: [id], onDelete: Cascade)
+  histories      DispenseHistory[]
+
+  @@index([medicamentId, dateExpiration])
+  @@unique([medicamentId, numeroLot, dateExpiration])
+}
+
+model DispenseHistory {
+  id           String   @id @default(uuid())
+  quantite     Int
+  createdAt    DateTime @default(now())
+  medicamentId String
+  lotId        String
+  userId       String
+  medicament   Medicament @relation(fields: [medicamentId], references: [id], onDelete: Cascade)
+  lot          Lot        @relation(fields: [lotId], references: [id], onDelete: Cascade)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([medicamentId])
+}
+
+model Equivalent {
+  id             String @id @default(uuid())
+  principeActif  String
+  nomMedicament  String
+}
