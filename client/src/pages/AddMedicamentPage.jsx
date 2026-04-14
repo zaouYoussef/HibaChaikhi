@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { apiFetch } from "../api.js";
 import BarcodeScanner from "../components/BarcodeScanner.jsx";
+import VisualMedScanner from "../components/VisualMedScanner.jsx";
 
 const empty = {
   nom: "",
@@ -31,10 +32,12 @@ export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
   const [scanOpen, setScanOpen] = useState(false);
+  const [visionOpen, setVisionOpen] = useState(false);
   const [msg, setMsg] = useState({ type: "", text: "" });
   const [loading, setLoading] = useState(false);
   const [catalog, setCatalog] = useState([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const [visionEquivalents, setVisionEquivalents] = useState([]);
   const nomInputRef = useRef(null);
   const suggestRef = useRef(null);
 
@@ -122,6 +125,41 @@ export default function AddMedicamentPage() {
       });
     }
     setTimeout(() => nomInputRef.current?.focus(), 100);
+  }, []);
+
+  const onVisionFrameAnalyze = useCallback(async (imageBase64) => {
+    const payload = await apiFetch("/scan/image", {
+      method: "POST",
+      body: JSON.stringify({ imageBase64 }),
+    });
+
+    const med = payload?.medicament;
+    if (med) {
+      setForm((f) => ({
+        ...f,
+        nom: med.nom || f.nom,
+        principeActif: med.principeActif || f.principeActif,
+        dosage: med.dosage || f.dosage,
+      }));
+      setVisionEquivalents(Array.isArray(payload?.equivalents) ? payload.equivalents : []);
+      setMsg({
+        type: "ok",
+        text:
+          payload?.status === "ok"
+            ? "Médicament détecté automatiquement par la caméra."
+            : "Lecture partielle: vérifiez les champs détectés avant enregistrement.",
+      });
+      setVisionOpen(false);
+      return true;
+    }
+
+    setMsg({
+      type: "ok",
+      text:
+        payload?.message ||
+        "Lecture en cours... rapprochez la caméra et cadrez le nom + dosage.",
+    });
+    return false;
   }, []);
 
   function applySuggestion(m) {
@@ -219,6 +257,19 @@ export default function AddMedicamentPage() {
             ✍️ Saisir sans scanner
             <span className="mt-1 block text-xs font-normal text-slate-600">
               Toujours possible
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setVisionOpen(true);
+              setMsg({ type: "", text: "" });
+            }}
+            className="rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50 py-4 text-sm font-semibold text-emerald-800 hover:bg-emerald-100 sm:col-span-2"
+          >
+            🤖 Lecture caméra automatique (IA)
+            <span className="mt-1 block text-xs font-normal text-emerald-700/90">
+              Pointez la boîte: nom + dosage détectés automatiquement
             </span>
           </button>
         </div>
@@ -341,6 +392,23 @@ export default function AddMedicamentPage() {
           </p>
         )}
 
+        {visionEquivalents.length > 0 && (
+          <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3">
+            <p className="text-xs font-semibold text-emerald-900">
+              Équivalents suggérés
+            </p>
+            <ul className="mt-2 space-y-1">
+              {visionEquivalents.map((eq, idx) => (
+                <li key={`${eq.nom}-${idx}`} className="text-xs text-emerald-900">
+                  {eq.nom}
+                  {eq.dosage ? ` · ${eq.dosage}` : ""}
+                  {eq.principeActif ? ` · ${eq.principeActif}` : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <button
           type="submit"
           disabled={loading}
@@ -352,6 +420,12 @@ export default function AddMedicamentPage() {
 
       {scanOpen && (
         <BarcodeScanner onDetected={onScan} onClose={() => setScanOpen(false)} />
+      )}
+      {visionOpen && (
+        <VisualMedScanner
+          onFrameAnalyze={onVisionFrameAnalyze}
+          onClose={() => setVisionOpen(false)}
+        />
       )}
     </div>
   );

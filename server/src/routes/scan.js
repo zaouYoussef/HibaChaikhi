@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { load } from "cheerio";
+import { createWorker } from "tesseract.js";
 import { prisma } from "../lib/prisma.js";
 
 const router = Router();
@@ -8,9 +9,156 @@ const router = Router();
 const scanSchema = z.object({
   code_barre: z.string().trim().min(2).max(120),
 });
+const imageScanSchema = z.object({
+  imageBase64: z.string().min(100),
+});
+
+let ocrWorkerPromise = null;
 
 function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeForMatch(input) {
+  return cleanText(input)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/[^a-z0-9%+/.-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenize(input) {
+  return normalizeForMatch(input)
+    .split(" ")
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 3);
+}
+
+function extractDosageCandidates(text) {
+  const rx =
+    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%))?/gi;
+  return [...String(text).matchAll(rx)].map((m) => cleanText(m[0]));
+}
+
+async function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = createWorker("fra+eng").catch((err) => {
+      ocrWorkerPromise = null;
+      throw err;
+    });
+  }
+  return ocrWorkerPromise;
+}
+
+async function readTextFromBase64Image(imageBase64) {
+  const cleanBase64 = String(imageBase64)
+    .replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, "")
+    .trim();
+  const imageBuffer = Buffer.from(cleanBase64, "base64");
+  if (!imageBuffer.length) return "";
+  if (imageBuffer.length > 4 * 1024 * 1024) {
+    throw new Error("Image trop lourde (max 4 Mo).");
+  }
+  const worker = await getOcrWorker();
+  const {
+    data: { text },
+  } = await worker.recognize(imageBuffer);
+  return cleanText(text);
+}
+
+async function inferMedicationFromOcrText(ocrText) {
+  const normalizedOcr = normalizeForMatch(ocrText);
+  const ocrTokens = new Set(tokenize(ocrText));
+  const dosageCandidates = extractDosageCandidates(ocrText).map(normalizeForMatch);
+  const meds = await prisma.medicament.findMany({
+    select: { id: true, nom: true, principeActif: true, dosage: true },
+  });
+
+  let best = null;
+  let bestScore = 0;
+  for (const med of meds) {
+    const nomNorm = normalizeForMatch(med.nom);
+    const principeNorm = normalizeForMatch(med.principeActif);
+    const dosageNorm = normalizeForMatch(med.dosage);
+    const nomTokens = tokenize(med.nom);
+    const tokenHits = nomTokens.reduce(
+      (sum, token) => sum + (ocrTokens.has(token) ? 1 : 0),
+      0
+    );
+
+    let score = tokenHits * 2;
+    if (nomNorm && normalizedOcr.includes(nomNorm)) score += 12;
+    if (principeNorm && normalizedOcr.includes(principeNorm)) score += 4;
+    if (dosageNorm && normalizedOcr.includes(dosageNorm)) score += 6;
+    if (
+      dosageCandidates.some(
+        (cand) => cand && dosageNorm && (cand.includes(dosageNorm) || dosageNorm.includes(cand))
+      )
+    ) {
+      score += 3;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = med;
+    }
+  }
+
+  if (!best || bestScore < 8) {
+    return {
+      status: "not_found",
+      confidence: 0,
+      medicament: null,
+      equivalents: [],
+      message:
+        "Texte détecté mais médicament non reconnu avec confiance suffisante.",
+    };
+  }
+
+  const equivalentsLocal = await prisma.medicament.findMany({
+    where: {
+      id: { not: best.id },
+      principeActif: { equals: best.principeActif },
+    },
+    select: { id: true, nom: true, principeActif: true, dosage: true },
+    take: 5,
+  });
+  const equivalentsRef = await prisma.equivalent.findMany({
+    where: { principeActif: { equals: best.principeActif } },
+    select: { nomMedicament: true, principeActif: true },
+    take: 5,
+  });
+
+  const equivalents = [
+    ...equivalentsLocal.map((m) => ({
+      nom: m.nom,
+      principeActif: m.principeActif,
+      dosage: m.dosage,
+      source: "local",
+    })),
+    ...equivalentsRef.map((m) => ({
+      nom: m.nomMedicament,
+      principeActif: m.principeActif,
+      dosage: "",
+      source: "reference",
+    })),
+  ].slice(0, 8);
+
+  return {
+    status: "ok",
+    confidence: Math.min(1, Number((bestScore / 20).toFixed(2))),
+    medicament: {
+      id: best.id,
+      nom: best.nom,
+      principeActif: best.principeActif,
+      dosage: best.dosage,
+      source: "vision_ocr",
+    },
+    equivalents,
+    message: "Médicament identifié par lecture caméra (OCR + matching local).",
+  };
 }
 
 function isBarcodeLike(value, barcode) {
@@ -132,6 +280,36 @@ router.post("/", async (req, res) => {
     medicament: null,
     message: "Aucun résultat trouvé sur medicament.ma. Utilisez la saisie manuelle.",
   });
+});
+
+router.post("/image", async (req, res) => {
+  const parsed = imageScanSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.flatten() });
+  }
+  try {
+    const ocrText = await readTextFromBase64Image(parsed.data.imageBase64);
+    if (!ocrText) {
+      return res.json({
+        status: "not_found",
+        confidence: 0,
+        medicament: null,
+        equivalents: [],
+        message: "Aucun texte lisible détecté. Rapprochez la caméra et stabilisez.",
+      });
+    }
+    const inferred = await inferMedicationFromOcrText(ocrText);
+    return res.json({
+      ...inferred,
+      ocrTextPreview: ocrText.slice(0, 240),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error:
+        err?.message ||
+        "Lecture image impossible pour le moment. Réessayez avec plus de lumière.",
+    });
+  }
 });
 
 export default router;
