@@ -19,6 +19,23 @@ function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
 }
 
+function splitDataUrl(input) {
+  const raw = String(input ?? "").trim();
+  const m = raw.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+  if (!m) {
+    return {
+      mimeType: "image/jpeg",
+      base64Data: raw.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, ""),
+      dataUrl: raw.startsWith("data:image/") ? raw : `data:image/jpeg;base64,${raw}`,
+    };
+  }
+  return {
+    mimeType: m[1],
+    base64Data: m[2],
+    dataUrl: raw,
+  };
+}
+
 function normalizeText(input) {
   return cleanText(input)
     .normalize("NFD")
@@ -56,101 +73,127 @@ function extractDosageCandidates(text) {
   return [...String(text).matchAll(rx)].map((m) => cleanText(m[0]));
 }
 
-function extractAfterKeyword(lines, keywords) {
-  for (const line of lines) {
-    const lowered = line.toLowerCase();
-    for (const keyword of keywords) {
-      const idx = lowered.indexOf(keyword);
-      if (idx === -1) continue;
-      const raw = line.slice(idx + keyword.length).replace(/^[:\s-]+/, "");
-      const value = cleanText(raw);
-      if (value && value.length >= 3) return value;
-    }
+function extractJsonObject(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return null;
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return null;
   }
-  return "";
 }
 
-function guessNameFromLines(lines, dosageCandidates) {
-  const blocked = [
-    "lot",
-    "expiration",
-    "exp",
-    "péremption",
-    "fabri",
-    "code",
-    "ean",
-    "cip",
-    "prix",
-    "notice",
-    "composition",
-    "posologie",
-    "voie",
-  ];
-  const dosageRx =
-    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|µg|ml|ui|iu|mui|%))?/gi;
-
-  const scored = lines
-    .map((line) => {
-      const lowered = line.toLowerCase();
-      if (blocked.some((w) => lowered.includes(w))) return null;
-      if (/^\d{6,}$/.test(line.replace(/\s+/g, ""))) return null;
-      if (line.length < 4) return null;
-
-      let score = 0;
-      if (/[a-zA-Z]/.test(line)) score += 2;
-      if (line.length >= 8 && line.length <= 70) score += 2;
-      if (/^[A-Z0-9\s\-/+.,()%]+$/.test(line)) score += 1;
-      if (dosageRx.test(line)) score += 2;
-      dosageRx.lastIndex = 0;
-
-      const stripped = cleanText(line.replace(dosageRx, ""));
-      if (stripped.length < 3) return null;
-      if (dosageCandidates.some((d) => line.includes(d))) score += 1;
-      return { line: stripped, score };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
-
-  return scored[0]?.line || "";
+function isLikelyMedicationName(value) {
+  const v = cleanText(value);
+  if (!v) return false;
+  if (/^\d{5,}$/.test(v.replace(/\s+/g, ""))) return false;
+  if (v.split(/\s+/).length > 7) return false;
+  if (v.length < 3 || v.length > 64) return false;
+  const lowered = v.toLowerCase();
+  if (
+    lowered.includes("notice") ||
+    lowered.includes("posologie") ||
+    lowered.includes("composition") ||
+    lowered.includes("boite")
+  ) {
+    return false;
+  }
+  return /[a-zA-Z]/.test(v);
 }
 
-function inferFreeformMedicamentFromOcrText(ocrText) {
-  const lines = normalizeOcrLines(ocrText);
-  const dosageCandidates = extractDosageCandidates(ocrText);
-  const principeActif = extractAfterKeyword(lines, [
-    "principe actif",
-    "dci",
-    "substance active",
-    "composition",
-  ]);
-  const guessedName = guessNameFromLines(lines, dosageCandidates);
-  if (!guessedName || guessedName.length < 3) return null;
+async function extractMedicationWithVisionApi(imageBase64) {
+  const apiKey = process.env.VISION_API_KEY?.trim();
+  if (!apiKey) return null;
+  const model = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
+  const endpoint =
+    process.env.VISION_API_URL?.trim() ||
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const { mimeType, base64Data } = splitDataUrl(imageBase64);
+  if (!base64Data) return null;
 
-  const confidence = Math.min(
-    0.7,
-    Number(
-      (
-        0.3 +
-        (dosageCandidates.length ? 0.15 : 0) +
-        (principeActif ? 0.15 : 0) +
-        (lines.length >= 3 ? 0.1 : 0)
-      ).toFixed(2)
-    )
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const prompt = `Analyse cette photo d'un médicament et retourne UNIQUEMENT un JSON valide:
+{
+  "nom": "nom commercial court",
+  "principeActif": "principe actif ou vide",
+  "dosage": "dosage ou forme ex: 500 mg, 1 g, 5 mg/mL",
+  "confidence": 0.0
+}
+Règles strictes:
+- confidence entre 0 et 1
+- pas de texte hors JSON
+- si incertain: confidence < 0.55 et champs vides
+- nom court (max 7 mots).`;
 
-  return {
-    status: "partial",
-    confidence,
-    medicament: {
-      nom: guessedName,
-      principeActif: principeActif || "",
-      dosage: dosageCandidates[0] || "",
-      source: "vision_ocr_raw",
-    },
-    equivalents: [],
-    message:
-      "Texte extrait depuis l'image. Vérifiez les champs détectés avant enregistrement.",
-  };
+    const res = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType || "image/jpeg",
+                  data: base64Data,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json",
+        },
+      }),
+    });
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const text = (payload?.candidates ?? [])
+      .flatMap((c) => c?.content?.parts ?? [])
+      .map((p) => p?.text ?? "")
+      .join("\n")
+      .trim();
+    const parsed = extractJsonObject(text);
+    if (!parsed) return null;
+
+    const nom = cleanText(parsed.nom);
+    const principeActif = cleanText(parsed.principeActif);
+    const dosage = cleanText(parsed.dosage);
+    const confidence = Number(parsed.confidence ?? 0);
+
+    if (!isLikelyMedicationName(nom)) return null;
+    if (!dosage || dosage.length < 2) return null;
+    if (!(confidence >= 0.55)) return null;
+
+    return {
+      status: "ok",
+      confidence: Math.min(1, Math.max(0, confidence)),
+      medicament: {
+        nom,
+        principeActif,
+        dosage,
+        source: "vision_api",
+      },
+      equivalents: [],
+      message: "Médicament détecté via API Vision IA.",
+      ocrTextPreview: "",
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function storeEquivalentReference(principeActif, nomMedicament) {
@@ -249,16 +292,12 @@ async function getOcrWorker() {
 }
 
 async function readTextFromBase64Image(imageBase64) {
-  const raw = String(imageBase64 || "").trim();
-  const cleanBase64 = raw.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, "");
+  const { base64Data: cleanBase64, dataUrl } = splitDataUrl(imageBase64);
   if (!cleanBase64) return "";
   const estimatedBytes = Math.floor((cleanBase64.length * 3) / 4);
   if (estimatedBytes > 4 * 1024 * 1024) {
     throw new Error("Image trop lourde (max 4 Mo).");
   }
-  const dataUrl = raw.startsWith("data:image/")
-    ? raw
-    : `data:image/jpeg;base64,${cleanBase64}`;
   const worker = await getOcrWorker();
   const {
     data: { text },
@@ -305,16 +344,14 @@ async function inferMedicationFromOcrText(ocrText) {
   }
 
   if (!best || bestScore < 8) {
-    return (
-      inferFreeformMedicamentFromOcrText(ocrText) || {
+    return {
       status: "not_found",
       confidence: 0,
       medicament: null,
       equivalents: [],
       message:
         "Texte détecté mais médicament non reconnu avec confiance suffisante.",
-    }
-    );
+    };
   }
 
   const equivalentsLocal = await prisma.medicament.findMany({
@@ -568,17 +605,35 @@ router.post("/image", async (req, res) => {
     return res.status(400).json({ error: parsed.error.flatten() });
   }
   try {
-    const ocrText = await readTextFromBase64Image(parsed.data.imageBase64);
-    if (!ocrText) {
+    let ocrText = "";
+    let inferred = await extractMedicationWithVisionApi(parsed.data.imageBase64);
+    if (!inferred) {
+      ocrText = await readTextFromBase64Image(parsed.data.imageBase64);
+      if (!ocrText) {
+        return res.json({
+          status: "not_found",
+          confidence: 0,
+          medicament: null,
+          equivalents: [],
+          message:
+            "Aucun texte lisible détecté. Essayez une image plus nette ou activez l'API Vision IA.",
+        });
+      }
+      inferred = await inferMedicationFromOcrText(ocrText);
+    }
+
+    if (!inferred?.medicament?.nom || !inferred?.medicament?.dosage) {
       return res.json({
         status: "not_found",
-        confidence: 0,
+        confidence: Number(inferred?.confidence ?? 0),
         medicament: null,
         equivalents: [],
-        message: "Aucun texte lisible détecté. Rapprochez la caméra et stabilisez.",
+        message:
+          "Détection trop incertaine. Reprenez la photo plus près (nom + dosage visibles).",
+        ocrTextPreview: ocrText.slice(0, 240),
       });
     }
-    const inferred = await inferMedicationFromOcrText(ocrText);
+
     let equivalentStored = false;
     let equivalentsStoredFromWeb = 0;
     let mergedEquivalents = Array.isArray(inferred?.equivalents)
@@ -612,7 +667,7 @@ router.post("/image", async (req, res) => {
       equivalents: mergedEquivalents,
       equivalentStored,
       equivalentsStoredFromWeb,
-      ocrTextPreview: ocrText.slice(0, 240),
+      ocrTextPreview: inferred?.ocrTextPreview || ocrText.slice(0, 240),
     });
   } catch (err) {
     return res.status(500).json({

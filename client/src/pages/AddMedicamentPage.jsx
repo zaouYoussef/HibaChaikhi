@@ -28,6 +28,15 @@ function isBarcodeLike(value) {
   return /^\d{6,}$/.test(cleaned);
 }
 
+function isLikelyMedicationName(value) {
+  const v = String(value ?? "").trim();
+  if (!v) return false;
+  if (v.split(/\s+/).length > 7) return false;
+  if (v.length < 3 || v.length > 64) return false;
+  if (/^\d{5,}$/.test(v.replace(/\s+/g, ""))) return false;
+  return /[a-zA-Z]/.test(v);
+}
+
 export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
@@ -134,7 +143,12 @@ export default function AddMedicamentPage() {
     });
 
     const med = payload?.medicament;
-    if (med) {
+    const isConfident =
+      Number(payload?.confidence ?? 0) >= 0.55 &&
+      isLikelyMedicationName(med?.nom) &&
+      String(med?.dosage ?? "").trim().length >= 2;
+
+    if (med && isConfident) {
       setForm((f) => ({
         ...f,
         nom: med.nom || f.nom,
@@ -157,7 +171,7 @@ export default function AddMedicamentPage() {
       type: "ok",
       text:
         payload?.message ||
-        "Lecture en cours... rapprochez la caméra et cadrez le nom + dosage.",
+        "Lecture incertaine... rapprochez la caméra et cadrez clairement nom + dosage.",
     });
     return false;
   }, []);
