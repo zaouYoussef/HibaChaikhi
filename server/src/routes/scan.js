@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { load } from "cheerio";
 import { prisma } from "../lib/prisma.js";
 
 const router = Router();
@@ -8,30 +9,17 @@ const scanSchema = z.object({
   code_barre: z.string().trim().min(2).max(120),
 });
 
-function decodeEntities(text) {
-  return String(text ?? "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&eacute;/gi, "e")
-    .replace(/&egrave;/gi, "e")
-    .replace(/&agrave;/gi, "a")
-    .replace(/&ccedil;/gi, "c");
+function cleanText(input) {
+  return String(input ?? "").replace(/\s+/g, " ").trim();
 }
 
-function cleanHtmlText(input) {
-  return decodeEntities(
-    String(input ?? "")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-  );
-}
-
-function extractFirst(html, regex) {
-  const m = html.match(regex);
-  return m?.[1] ? cleanHtmlText(m[1]) : "";
+function isBarcodeLike(value, barcode) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return true;
+  const normalized = raw.replace(/\s+/g, "");
+  if (normalized === barcode) return true;
+  if (/^\d{6,}$/.test(normalized)) return true;
+  return false;
 }
 
 async function fetchMedicamentsMoroccoByBarcode(barcode) {
@@ -47,20 +35,29 @@ async function fetchMedicamentsMoroccoByBarcode(barcode) {
     });
     if (!res.ok) return null;
     const html = await res.text();
+    const $ = load(html);
+    const ogTitle = cleanText($('meta[property="og:title"]').attr("content"))
+      .replace(/\s+-\s*Medicament\.ma\s*$/i, "")
+      .replace(/^Recherche de\s*/i, "")
+      .replace(/^Recherche\s*-\s*/i, "")
+      .trim();
+    const nom = cleanText($(".single.single-medicament > h3").first().text()) || ogTitle;
+    if (!nom || isBarcodeLike(nom, barcode)) return null;
+    const lowerNom = nom.toLowerCase();
+    if (
+      lowerNom.includes("page non trouvee") ||
+      lowerNom.includes("médicament non trouvé") ||
+      lowerNom.includes("medicament non trouve") ||
+      lowerNom.includes("suggestions")
+    ) {
+      return null;
+    }
 
-    const nom = extractFirst(
-      html,
-      /<div[^>]*class=["'][^"']*single\s+single-medicament[^"']*["'][^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/i
+    const principeActif = cleanText(
+      $("tr.field-composition > .value").first().text()
     );
-    if (!nom) return null;
-
-    const principeActif = extractFirst(
-      html,
-      /<tr[^>]*class=["'][^"']*field-composition[^"']*["'][^>]*>[\s\S]*?<[^>]*class=["'][^"']*value[^"']*["'][^>]*>([\s\S]*?)<\/[^>]+>/i
-    );
-    const presentation = extractFirst(
-      html,
-      /<tr[^>]*class=["'][^"']*field-presentation[^"']*["'][^>]*>[\s\S]*?<[^>]*class=["'][^"']*value[^"']*["'][^>]*>([\s\S]*?)<\/[^>]+>/i
+    const presentation = cleanText(
+      $("tr.field-presentation > .value").first().text()
     );
 
     return {

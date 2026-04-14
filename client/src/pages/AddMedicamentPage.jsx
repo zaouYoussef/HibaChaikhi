@@ -22,6 +22,11 @@ function uniqueTemplates(meds) {
   return [...map.values()];
 }
 
+function isBarcodeLike(value) {
+  const cleaned = String(value ?? "").replace(/\s+/g, "");
+  return /^\d{6,}$/.test(cleaned);
+}
+
 export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
@@ -92,9 +97,12 @@ export default function AddMedicamentPage() {
         body: JSON.stringify({ code_barre: normalizedCode }),
       });
       const med = payload?.medicament;
+      const candidateName = med?.nom || payload?.querySuggestion || "";
+      const safeName =
+        candidateName && !isBarcodeLike(candidateName) ? candidateName : "";
       setForm((f) => ({
         ...f,
-        nom: med?.nom || f.nom || scanned,
+        nom: safeName || f.nom,
         principeActif: med?.principeActif || f.principeActif,
         dosage: med?.dosage || f.dosage,
       }));
@@ -105,13 +113,12 @@ export default function AddMedicamentPage() {
             ? "Médicament reconnu en base locale : formulaire pré-rempli."
             : payload?.status === "external"
               ? "Données récupérées via medicament.ma : vérifiez les champs avant enregistrement."
-              : "Scan capturé, complétez manuellement si nécessaire.",
+              : "Code scanné, mais fiche introuvable sur medicament.ma. Saisissez le nom, le principe actif et le dosage manuellement.",
       });
     } catch {
-      setForm((f) => ({ ...f, nom: scanned }));
       setMsg({
         type: "ok",
-        text: "Scan capturé. L’API de scan est indisponible, complétez manuellement.",
+        text: "Scan capturé, mais l’API de scan est indisponible. Saisissez les champs manuellement.",
       });
     }
     setTimeout(() => nomInputRef.current?.focus(), 100);
