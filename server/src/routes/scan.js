@@ -127,29 +127,18 @@ async function extractMedicationWithVisionApi(imageBase64, log = () => {}) {
     log("vision_skipped_invalid_key");
     return null;
   }
-  const model = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
-  const endpoint =
-    process.env.VISION_API_URL?.trim() ||
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-      model
-    )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const configuredModel = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
+  const customEndpoint = process.env.VISION_API_URL?.trim();
+  const modelCandidates = [
+    configuredModel,
+    "gemini-1.5-flash-latest",
+    "gemini-2.0-flash",
+  ].filter((m, idx, arr) => m && arr.indexOf(m) === idx);
   const { mimeType, base64Data } = splitDataUrl(imageBase64);
   if (!base64Data) {
     log("vision_skipped_no_base64");
     return null;
   }
-  log("vision_request_start", {
-    model,
-    endpointHost: (() => {
-      try {
-        return new URL(endpoint).host;
-      } catch {
-        return "invalid-url";
-      }
-    })(),
-    mimeType,
-    base64Length: base64Data.length,
-  });
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
@@ -161,95 +150,129 @@ async function extractMedicationWithVisionApi(imageBase64, log = () => {}) {
   "dosage": "dosage ou forme ex: 500 mg, 1 g, 5 mg/mL",
   "confidence": 0.0
 }
-Règles strictes:
+Regles strictes:
 - confidence entre 0 et 1
 - pas de texte hors JSON
 - si incertain: confidence < 0.55 et champs vides
 - nom court (max 7 mots).`;
 
-    const res = await fetch(endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { text: prompt },
-              {
-                inline_data: {
-                  mime_type: mimeType || "image/jpeg",
-                  data: base64Data,
-                },
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: "application/json",
-        },
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      log("vision_http_error", {
-        status: res.status,
-        bodyPreview: body.slice(0, 200),
+    for (const model of customEndpoint ? [configuredModel] : modelCandidates) {
+      const endpoint =
+        customEndpoint ||
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+          model
+        )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      log("vision_request_start", {
+        model,
+        endpointHost: (() => {
+          try {
+            return new URL(endpoint).host;
+          } catch {
+            return "invalid-url";
+          }
+        })(),
+        mimeType,
+        base64Length: base64Data.length,
       });
-      return null;
-    }
-    const payload = await res.json();
-    const text = (payload?.candidates ?? [])
-      .flatMap((c) => c?.content?.parts ?? [])
-      .map((p) => p?.text ?? "")
-      .join("\n")
-      .trim();
-    const parsed = extractJsonObject(text);
-    if (!parsed) {
-      log("vision_json_parse_failed", { rawPreview: text.slice(0, 200) });
-      return null;
-    }
 
-    const nom = cleanText(parsed.nom);
-    const principeActif = cleanText(parsed.principeActif);
-    const dosage = cleanText(parsed.dosage);
-    const confidence = Number(parsed.confidence ?? 0);
+      // eslint-disable-next-line no-await-in-loop
+      const res = await fetch(endpoint, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: prompt },
+                {
+                  inline_data: {
+                    mime_type: mimeType || "image/jpeg",
+                    data: base64Data,
+                  },
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json",
+          },
+        }),
+      });
 
-    if (!isLikelyMedicationName(nom)) {
-      log("vision_rejected_name", { nom });
-      return null;
-    }
-    if (!dosage || dosage.length < 2) {
-      log("vision_rejected_dosage", { dosage });
-      return null;
-    }
-    if (!(confidence >= 0.55)) {
-      log("vision_rejected_confidence", { confidence });
-      return null;
-    }
+      if (!res.ok) {
+        // eslint-disable-next-line no-await-in-loop
+        const body = await res.text().catch(() => "");
+        log("vision_http_error", {
+          model,
+          status: res.status,
+          bodyPreview: body.slice(0, 200),
+        });
+        if (!customEndpoint && res.status === 404) {
+          continue;
+        }
+        return null;
+      }
 
-    log("vision_success", {
-      nom,
-      principeActif,
-      dosage,
-      confidence,
-    });
+      // eslint-disable-next-line no-await-in-loop
+      const payload = await res.json();
+      const text = (payload?.candidates ?? [])
+        .flatMap((c) => c?.content?.parts ?? [])
+        .map((p) => p?.text ?? "")
+        .join("\n")
+        .trim();
+      const parsed = extractJsonObject(text);
+      if (!parsed) {
+        log("vision_json_parse_failed", {
+          model,
+          rawPreview: text.slice(0, 200),
+        });
+        continue;
+      }
 
-    return {
-      status: "ok",
-      confidence: Math.min(1, Math.max(0, confidence)),
-      medicament: {
+      const nom = cleanText(parsed.nom);
+      const principeActif = cleanText(parsed.principeActif);
+      const dosage = cleanText(parsed.dosage);
+      const confidence = Number(parsed.confidence ?? 0);
+
+      if (!isLikelyMedicationName(nom)) {
+        log("vision_rejected_name", { model, nom });
+        continue;
+      }
+      if (!dosage || dosage.length < 2) {
+        log("vision_rejected_dosage", { model, dosage });
+        continue;
+      }
+      if (!(confidence >= 0.55)) {
+        log("vision_rejected_confidence", { model, confidence });
+        continue;
+      }
+
+      log("vision_success", {
+        model,
         nom,
         principeActif,
         dosage,
-        source: "vision_api",
-      },
-      equivalents: [],
-      message: "Médicament détecté via API Vision IA.",
-      ocrTextPreview: "",
-    };
+        confidence,
+      });
+
+      return {
+        status: "ok",
+        confidence: Math.min(1, Math.max(0, confidence)),
+        medicament: {
+          nom,
+          principeActif,
+          dosage,
+          source: "vision_api",
+        },
+        equivalents: [],
+        message: "Médicament détecté via API Vision IA.",
+        ocrTextPreview: "",
+      };
+    }
+    return null;
   } catch (err) {
     log("vision_exception", {
       name: err?.name,
@@ -399,8 +422,9 @@ async function inferMedicationFromOcrText(ocrText) {
 
     let score = tokenHits * 2;
     if (nomNorm && normalizedOcr.includes(nomNorm)) score += 12;
-    if (principeNorm && normalizedOcr.includes(principeNorm)) score += 4;
+    if (principeNorm && normalizedOcr.includes(principeNorm)) score += 7;
     if (dosageNorm && normalizedOcr.includes(dosageNorm)) score += 6;
+    if (tokenHits > 0 && nomTokens.length <= 2) score += 2;
     if (
       dosageCandidates.some(
         (cand) => cand && dosageNorm && (cand.includes(dosageNorm) || dosageNorm.includes(cand))
@@ -415,7 +439,7 @@ async function inferMedicationFromOcrText(ocrText) {
     }
   }
 
-  if (!best || bestScore < 8) {
+  if (!best || bestScore < 6) {
     return {
       status: "not_found",
       confidence: 0,
