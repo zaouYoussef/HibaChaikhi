@@ -118,6 +118,38 @@ function buildSuggestionKey(item) {
   return `${normalizeText(item.nom)}|${normalizeText(item.dosage)}|${normalizeText(item.principeActif)}`;
 }
 
+function buildQueryCandidates(query) {
+  const original = String(query ?? "").trim();
+  const normalized = normalizeText(original);
+  const set = new Set([original]);
+
+  const synonymMap = [
+    { fr: "vitamine c", terms: ["vitamin c", "ascorbic acid"] },
+    { fr: "vit c", terms: ["vitamin c", "ascorbic acid"] },
+    { fr: "paracetamol", terms: ["acetaminophen"] },
+    { fr: "cetirizine", terms: ["cetirizine hydrochloride"] },
+    { fr: "desloratadine", terms: ["desloratadine"] },
+    { fr: "ibuprofene", terms: ["ibuprofen"] },
+    { fr: "amoxicilline", terms: ["amoxicillin"] },
+    { fr: "omeprazole", terms: ["omeprazole"] },
+  ];
+
+  for (const row of synonymMap) {
+    if (normalized.includes(row.fr)) {
+      for (const term of row.terms) set.add(term);
+    }
+  }
+
+  if (normalized.startsWith("vitamine ")) {
+    const maybeLetter = normalized.replace("vitamine ", "").trim();
+    if (maybeLetter.length <= 3) {
+      set.add(`vitamin ${maybeLetter.toUpperCase()}`);
+    }
+  }
+
+  return [...set].filter(Boolean);
+}
+
 function isValidEquivalentName(value) {
   const name = String(value ?? "").trim();
   if (!name) return false;
@@ -129,9 +161,9 @@ function isValidEquivalentName(value) {
 
 async function fetchRxNormSuggestions(query) {
   const nq = normalizeText(query);
-  const queryCandidates = [query];
-  if (nq.startsWith("parac") || nq.startsWith("dolipr")) {
-    queryCandidates.push("acetaminophen");
+  const queryCandidates = buildQueryCandidates(query);
+  if (nq.startsWith("parac") || nq.startsWith("dolipr") || nq.startsWith("dafal")) {
+    queryCandidates.push("acetaminophen", "paracetamol");
   }
 
   const controller = new AbortController();
@@ -158,6 +190,7 @@ async function fetchRxNormSuggestions(query) {
           .trim();
         if (!rawName) return null;
         if (rawName.startsWith("{")) return null;
+        if (/\bpack\b/i.test(rawName)) return null;
         const dosageMatch = rawName.match(
           /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|iu)\b/i
         );
