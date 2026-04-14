@@ -137,43 +137,55 @@ export default function AddMedicamentPage() {
   }, []);
 
   const onVisionFrameAnalyze = useCallback(async (imageBase64) => {
-    const payload = await apiFetch("/scan/image", {
-      method: "POST",
-      body: JSON.stringify({ imageBase64 }),
-    });
+    try {
+      const payload = await apiFetch("/scan/image", {
+        method: "POST",
+        body: JSON.stringify({ imageBase64 }),
+      });
 
-    const med = payload?.medicament;
-    const isConfident =
-      Number(payload?.confidence ?? 0) >= 0.55 &&
-      isLikelyMedicationName(med?.nom) &&
-      String(med?.dosage ?? "").trim().length >= 2;
+      const med = payload?.medicament;
+      const isConfident =
+        Number(payload?.confidence ?? 0) >= 0.55 &&
+        isLikelyMedicationName(med?.nom) &&
+        String(med?.dosage ?? "").trim().length >= 2;
 
-    if (med && isConfident) {
-      setForm((f) => ({
-        ...f,
-        nom: med.nom || f.nom,
-        principeActif: med.principeActif || f.principeActif,
-        dosage: med.dosage || f.dosage,
-      }));
-      setVisionEquivalents(Array.isArray(payload?.equivalents) ? payload.equivalents : []);
+      if (med && isConfident) {
+        setForm((f) => ({
+          ...f,
+          nom: med.nom || f.nom,
+          principeActif: med.principeActif || f.principeActif,
+          dosage: med.dosage || f.dosage,
+        }));
+        setVisionEquivalents(
+          Array.isArray(payload?.equivalents) ? payload.equivalents : []
+        );
+        setMsg({
+          type: "ok",
+          text:
+            payload?.status === "ok"
+              ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`
+              : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`,
+        });
+        setVisionOpen(false);
+        return true;
+      }
+
       setMsg({
         type: "ok",
         text:
-          payload?.status === "ok"
-            ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`
-            : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`,
+          payload?.message ||
+          "Lecture incertaine... rapprochez la caméra et cadrez clairement nom + dosage.",
       });
-      setVisionOpen(false);
-      return true;
+      return false;
+    } catch (err) {
+      setMsg({
+        type: "err",
+        text:
+          err?.message ||
+          "Analyse impossible. Vérifiez la clé Vision API et réessayez.",
+      });
+      return false;
     }
-
-    setMsg({
-      type: "ok",
-      text:
-        payload?.message ||
-        "Lecture incertaine... rapprochez la caméra et cadrez clairement nom + dosage.",
-    });
-    return false;
   }, []);
 
   function applySuggestion(m) {
@@ -438,6 +450,14 @@ export default function AddMedicamentPage() {
       {visionOpen && (
         <VisualMedScanner
           onFrameAnalyze={onVisionFrameAnalyze}
+          onStalled={() => {
+            setVisionOpen(false);
+            setMsg({
+              type: "err",
+              text:
+                "Détection auto interrompue après plusieurs essais. Passez en saisie manuelle ou reprenez une photo plus nette.",
+            });
+          }}
           onClose={() => setVisionOpen(false)}
         />
       )}

@@ -106,7 +106,13 @@ function isLikelyMedicationName(value) {
 
 async function extractMedicationWithVisionApi(imageBase64) {
   const apiKey = process.env.VISION_API_KEY?.trim();
-  if (!apiKey) return null;
+  if (
+    !apiKey ||
+    apiKey === "TA_NOUVELLE_CLE" ||
+    apiKey.toLowerCase().includes("nouvelle_cle")
+  ) {
+    return null;
+  }
   const model = process.env.VISION_MODEL?.trim() || "gemini-1.5-flash";
   const endpoint =
     process.env.VISION_API_URL?.trim() ||

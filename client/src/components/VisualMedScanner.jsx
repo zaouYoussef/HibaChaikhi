@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 
-export default function VisualMedScanner({ onFrameAnalyze, onClose }) {
+export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const timerRef = useRef(null);
   const busyRef = useRef(false);
+  const attemptsRef = useRef(0);
+  const startedAtRef = useRef(Date.now());
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState("Initialisation caméra...");
   const [err, setErr] = useState("");
+  const MAX_AUTO_ATTEMPTS = 8;
+  const MAX_AUTO_MS = 26000;
 
   function stopAll() {
     if (timerRef.current) {
@@ -43,10 +47,32 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose }) {
         stopAll();
         return;
       }
+      attemptsRef.current += 1;
+      const elapsed = Date.now() - startedAtRef.current;
+      if (
+        attemptsRef.current >= MAX_AUTO_ATTEMPTS ||
+        elapsed >= MAX_AUTO_MS
+      ) {
+        stopAll();
+        setStatus("Aucune détection fiable. Retour à la saisie manuelle.");
+        onStalled?.({
+          attempts: attemptsRef.current,
+          elapsedMs: elapsed,
+        });
+        return;
+      }
       setStatus("Analyse faite. Continuez à cadrer le médicament...");
     } catch (e) {
+      attemptsRef.current += 1;
       setErr(e?.message || "Analyse image impossible.");
       setStatus("Échec de lecture. Ajustez lumière/netteté.");
+      if (attemptsRef.current >= MAX_AUTO_ATTEMPTS) {
+        stopAll();
+        onStalled?.({
+          attempts: attemptsRef.current,
+          elapsedMs: Date.now() - startedAtRef.current,
+        });
+      }
     } finally {
       busyRef.current = false;
     }
@@ -74,6 +100,8 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose }) {
         video.srcObject = stream;
         await video.play();
         setReady(true);
+        attemptsRef.current = 0;
+        startedAtRef.current = Date.now();
         setStatus("Pointez le médicament, lecture automatique active.");
         timerRef.current = setInterval(() => {
           analyzeCurrentFrame();
