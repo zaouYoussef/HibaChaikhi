@@ -146,8 +146,8 @@ export default function AddMedicamentPage() {
         type: "ok",
         text:
           payload?.status === "ok"
-            ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}`
-            : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}`,
+            ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`
+            : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`,
       });
       setVisionOpen(false);
       return true;

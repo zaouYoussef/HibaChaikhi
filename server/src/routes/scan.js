@@ -19,6 +19,13 @@ function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
 }
 
+function normalizeText(input) {
+  return cleanText(input)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
 function normalizeOcrLines(input) {
   return String(input ?? "")
     .split(/\r?\n/g)
@@ -159,6 +166,76 @@ async function storeEquivalentReference(principeActif, nomMedicament) {
     data: { principeActif: principe, nomMedicament: nom },
   });
   return true;
+}
+
+async function storeEquivalentReferencesBulk(principeActif, names) {
+  const unique = [...new Set((names ?? []).map((n) => cleanText(n)).filter(Boolean))];
+  let stored = 0;
+  for (const name of unique) {
+    // eslint-disable-next-line no-await-in-loop
+    const created = await storeEquivalentReference(principeActif, name);
+    if (created) stored += 1;
+  }
+  return stored;
+}
+
+function dedupeEquivalentItems(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items ?? []) {
+    const key = `${normalizeText(item?.nom)}|${normalizeText(item?.principeActif)}|${normalizeText(item?.dosage)}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+async function fetchRxNormWebEquivalents({ nom, principeActif }) {
+  const query = cleanText(principeActif || nom);
+  if (query.length < 2) return [];
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  try {
+    const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(
+      query
+    )}`;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const groups = data?.drugGroup?.conceptGroup ?? [];
+    const concepts = groups.flatMap((g) => g?.conceptProperties ?? []);
+    const results = concepts
+      .map((c) => String(c?.name ?? "").trim())
+      .filter(Boolean)
+      .map((raw) => {
+        const normalizedName = raw.replace(/acetaminophen/gi, "paracetamol").trim();
+        const dosageMatch = normalizedName.match(
+          /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|iu|ui)\b/i
+        );
+        const dosage = dosageMatch ? dosageMatch[0] : "";
+        const pa = cleanText(
+          principeActif ||
+            (dosageMatch
+              ? normalizedName.slice(0, dosageMatch.index)
+              : normalizedName.split(/\s+/).slice(0, 2).join(" "))
+        );
+        return {
+          nom: normalizedName,
+          principeActif: pa,
+          dosage,
+          source: "rxnorm_web",
+        };
+      })
+      .filter((row) => normalizeText(row.nom) !== normalizeText(nom))
+      .slice(0, 10);
+    return dedupeEquivalentItems(results);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function getOcrWorker() {
@@ -503,15 +580,38 @@ router.post("/image", async (req, res) => {
     }
     const inferred = await inferMedicationFromOcrText(ocrText);
     let equivalentStored = false;
+    let equivalentsStoredFromWeb = 0;
+    let mergedEquivalents = Array.isArray(inferred?.equivalents)
+      ? [...inferred.equivalents]
+      : [];
     if (inferred?.medicament?.nom && inferred?.medicament?.principeActif) {
       equivalentStored = await storeEquivalentReference(
         inferred.medicament.principeActif,
         inferred.medicament.nom
       );
     }
+    if (inferred?.medicament?.nom) {
+      const webEquivalents = await fetchRxNormWebEquivalents({
+        nom: inferred.medicament.nom,
+        principeActif: inferred.medicament.principeActif,
+      });
+      mergedEquivalents = dedupeEquivalentItems([
+        ...mergedEquivalents,
+        ...webEquivalents,
+      ]).slice(0, 10);
+
+      if (inferred?.medicament?.principeActif && webEquivalents.length > 0) {
+        equivalentsStoredFromWeb = await storeEquivalentReferencesBulk(
+          inferred.medicament.principeActif,
+          webEquivalents.map((e) => e.nom)
+        );
+      }
+    }
     return res.json({
       ...inferred,
+      equivalents: mergedEquivalents,
       equivalentStored,
+      equivalentsStoredFromWeb,
       ocrTextPreview: ocrText.slice(0, 240),
     });
   } catch (err) {
