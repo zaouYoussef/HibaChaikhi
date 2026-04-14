@@ -104,7 +104,7 @@ export default function AddMedicamentPage() {
           payload?.status === "local"
             ? "Médicament reconnu en base locale : formulaire pré-rempli."
             : payload?.status === "external"
-              ? "Données récupérées via OpenFDA : vérifiez les champs avant enregistrement."
+              ? "Données récupérées via medicament.ma : vérifiez les champs avant enregistrement."
               : "Scan capturé, complétez manuellement si nécessaire.",
       });
     } catch {
@@ -173,6 +173,12 @@ export default function AddMedicamentPage() {
       <h1 className="text-2xl font-bold text-slate-900 mb-6">
         Ajouter un médicament
       </h1>
+      {catalog.length === 0 && (
+        <p className="mb-4 rounded-xl border border-clinic-200 bg-clinic-50 px-4 py-3 text-sm text-clinic-900">
+          Aucun stock local détecté. Scannez un médicament pour pré-remplir les
+          champs, puis ajoutez quantité et expiration.
+        </p>
+      )}
 
       <form
         onSubmit={handleSubmit}
@@ -309,7 +315,7 @@ export default function AddMedicamentPage() {
           </label>
           <input
             required
-            type="date"
+            type="month"
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm max-w-[220px]"
             value={form.dateExpiration}
             onChange={(e) => update("dateExpiration", e.target.value)}

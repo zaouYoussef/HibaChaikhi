@@ -34,12 +34,6 @@ function extractFirst(html, regex) {
   return m?.[1] ? cleanHtmlText(m[1]) : "";
 }
 
-function pickFirstText(value) {
-  if (Array.isArray(value) && value.length > 0) return String(value[0]).trim();
-  if (typeof value === "string") return value.trim();
-  return "";
-}
-
 async function fetchMedicamentsMoroccoByBarcode(barcode) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 7000);
@@ -74,41 +68,6 @@ async function fetchMedicamentsMoroccoByBarcode(barcode) {
       principeActif: principeActif || "Principe actif non renseigné",
       dosage: presentation || "",
       source: "medicaments_morocco",
-    };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchOpenFda(searchExpression) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 6000);
-  const url = `https://api.fda.gov/drug/label.json?search=${encodeURIComponent(searchExpression)}&limit=1`;
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null;
-    const body = await res.json();
-    const first = body?.results?.[0];
-    if (!first) return null;
-    const openfda = first.openfda ?? {};
-    const nom =
-      pickFirstText(openfda.brand_name) ||
-      pickFirstText(openfda.generic_name) ||
-      pickFirstText(first.purpose) ||
-      "";
-    const principeActif =
-      pickFirstText(openfda.substance_name) ||
-      pickFirstText(first.active_ingredient) ||
-      pickFirstText(openfda.generic_name) ||
-      "";
-    if (!nom && !principeActif) return null;
-    return {
-      nom: nom || "Médicament inconnu",
-      principeActif: principeActif || "Principe actif non renseigné",
-      dosage: "",
-      source: "openfda",
     };
   } catch {
     return null;
@@ -169,34 +128,12 @@ router.post("/", async (req, res) => {
     });
   }
 
-  const searchCandidates = [
-    `openfda.product_ndc:${code}`,
-    `openfda.package_ndc:${code}`,
-    code,
-  ];
-
-  let external = null;
-  for (const expression of searchCandidates) {
-    external = await fetchOpenFda(expression);
-    if (external) break;
-  }
-
-  if (external) {
-    return res.json({
-      status: "external",
-      code_barre: code,
-      querySuggestion: external.nom,
-      medicament: external,
-      message: "Résultat récupéré via OpenFDA",
-    });
-  }
-
   return res.json({
     status: "not_found",
     code_barre: code,
     querySuggestion: code,
     medicament: null,
-    message: "Aucun résultat trouvé. Utilisez la recherche manuelle.",
+    message: "Aucun résultat trouvé sur medicament.ma. Utilisez la saisie manuelle.",
   });
 });
 

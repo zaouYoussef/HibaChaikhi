@@ -8,7 +8,6 @@ function formatDate(iso) {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
   return d.toLocaleDateString("fr-FR", {
-    day: "numeric",
     month: "short",
     year: "numeric",
   });
@@ -128,7 +127,8 @@ export default function DashboardPage() {
 
         {sortedMeds.length === 0 ? (
           <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-600">
-            Aucun médicament enregistré.{" "}
+            Aucun stock local pour le moment. Commencez par scanner et enregistrer
+            vos premiers médicaments depuis la page Ajouter.{" "}
             <Link to="/ajouter" className="font-medium text-clinic-700 underline">
               Ajouter un médicament
             </Link>

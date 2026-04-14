@@ -7,7 +7,6 @@ function formatDate(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
   return d.toLocaleDateString("fr-FR", {
-    day: "2-digit",
     month: "short",
     year: "numeric",
   });
@@ -144,7 +143,7 @@ export default function SearchPage() {
         scanned?.status === "local"
           ? "Scan reconnu dans la base locale."
           : scanned?.status === "external"
-            ? "Scan reconnu via OpenFDA."
+            ? "Scan reconnu via medicament.ma."
             : "Scan capturé. Résultat limité, utilisez la recherche manuelle."
       );
     } catch {
