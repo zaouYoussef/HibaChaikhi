@@ -293,7 +293,7 @@ export default function AddMedicamentPage() {
             }}
             className="rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50 py-4 text-sm font-semibold text-emerald-800 hover:bg-emerald-100 sm:col-span-2"
           >
-            🤖 Lecture caméra automatique (IA)
+            🤖 Lecture caméra automatique
             <span className="mt-1 block text-xs font-normal text-emerald-700/90">
               Pointez la boîte: nom + dosage détectés automatiquement
             </span>

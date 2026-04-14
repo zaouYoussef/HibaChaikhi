@@ -122,7 +122,7 @@ export default function VisualMedScanner({ onFrameAnalyze, onClose, onStalled })
     <div className="fixed inset-0 z-50 flex flex-col bg-black p-3 sm:p-4">
       <div className="mb-2 flex items-center justify-between gap-2 text-white">
         <div>
-          <p className="text-sm font-semibold">Lecture caméra automatique (IA)</p>
+          <p className="text-sm font-semibold">Lecture caméra automatique</p>
           <p className="text-xs text-white/75">
             Cadrez le nom + dosage de la boîte. Détection toutes les 2 secondes.
           </p>

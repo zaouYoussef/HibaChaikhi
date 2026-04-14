@@ -354,6 +354,31 @@ export async function searchMedicaments(req, res) {
     }
   }
 
+  const equivalentAvailableLots = altMeds
+    .flatMap((m) =>
+      (m.lots ?? [])
+        .filter((lot) => lot.quantite > 0)
+        .map((lot) => ({ medicament: m, lot }))
+    )
+    .sort(
+      (a, b) =>
+        new Date(a.lot.dateExpiration).getTime() -
+        new Date(b.lot.dateExpiration).getTime()
+    );
+
+  if (equivalentAvailableLots.length > 0) {
+    const recommended = equivalentAvailableLots[0];
+    return res.json({
+      status: "disponible",
+      message: "Équivalent disponible en stock",
+      recommended: mapMed(recommended.medicament, recommended.lot),
+      items: equivalentAvailableLots.map(({ medicament, lot }) =>
+        mapMed(medicament, lot)
+      ),
+      equivalents,
+    });
+  }
+
   return res.json({
     status: "non_disponible",
     message: "Médicament non disponible",
