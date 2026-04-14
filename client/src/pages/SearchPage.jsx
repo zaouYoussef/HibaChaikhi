@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { apiFetch } from "../api.js";
-import BarcodeScanner from "../components/BarcodeScanner.jsx";
 
 function formatDate(iso) {
   if (!iso) return "—";
@@ -22,7 +21,6 @@ export default function SearchPage() {
   const [suggestLoading, setSuggestLoading] = useState(false);
   const [error, setError] = useState("");
   const [useMsg, setUseMsg] = useState("");
-  const [scanOpen, setScanOpen] = useState(false);
   const lastSearchedRef = useRef("");
 
   async function runSearch(rawQuery) {
@@ -128,32 +126,6 @@ export default function SearchPage() {
   const dispo = result?.status === "disponible";
   const equivalentDispo = result?.status === "equivalent_disponible";
 
-  async function onScanDetected(decodedText) {
-    const code = decodedText.trim().replace(/\s+/g, "");
-    setScanOpen(false);
-    setUseMsg("");
-    try {
-      const scanned = await apiFetch("/scan", {
-        method: "POST",
-        body: JSON.stringify({ code_barre: code }),
-      });
-      const nextQuery = scanned?.querySuggestion || code;
-      setQ(nextQuery);
-      await runSearch(nextQuery);
-      setUseMsg(
-        scanned?.status === "local"
-          ? "Scan reconnu dans la base locale."
-          : scanned?.status === "external"
-            ? "Scan reconnu via medicament.ma."
-            : "Scan capturé. Résultat limité, utilisez la recherche manuelle."
-      );
-    } catch {
-      setQ(code);
-      await runSearch(code);
-      setUseMsg("Scan capturé. Bascule en recherche manuelle.");
-    }
-  }
-
   return (
     <div>
       <h1 className="text-2xl font-bold text-slate-900 mb-1">
@@ -162,16 +134,6 @@ export default function SearchPage() {
       <p className="text-slate-600 text-sm mb-4">
         Mode pharmacien rapide: recherche + délivrance en quelques secondes.
       </p>
-
-      <div className="mb-3">
-        <button
-          type="button"
-          onClick={() => setScanOpen(true)}
-          className="inline-flex w-full items-center justify-center rounded-xl border-2 border-dashed border-clinic-300 bg-clinic-50 px-4 py-2 text-sm font-semibold text-clinic-800 hover:bg-clinic-100 sm:w-auto"
-        >
-          Scanner (QR / code-barres)
-        </button>
-      </div>
 
       <form
         onSubmit={search}
@@ -403,13 +365,6 @@ export default function SearchPage() {
             </div>
           )}
         </div>
-      )}
-
-      {scanOpen && (
-        <BarcodeScanner
-          onDetected={onScanDetected}
-          onClose={() => setScanOpen(false)}
-        />
       )}
     </div>
   );
