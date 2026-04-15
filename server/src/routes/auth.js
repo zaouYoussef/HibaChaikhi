@@ -29,7 +29,7 @@ function authErrorResponse(res, err, context) {
 const registerSchema = z.object({
   email: z.string().email("Email invalide"),
   password: z.string().min(6, "Mot de passe : au moins 6 caractères"),
-  name: z.string().max(120).optional(),
+  name: z.string().trim().min(1, "Nom requis").max(120, "Nom trop long"),
 });
 
 const loginSchema = z.object({
@@ -50,7 +50,7 @@ router.post("/register", async (req, res) => {
     }
     const hash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
-      data: { email, password: hash, name: name ?? null },
+      data: { email, password: hash, name },
       select: { id: true, email: true, name: true },
     });
     const token = signToken({ sub: user.id, email: user.email });

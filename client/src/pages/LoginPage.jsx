@@ -17,13 +17,17 @@ export default function LoginPage() {
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
+    if (mode === "register" && !name.trim()) {
+      setError("Le nom est obligatoire.");
+      return;
+    }
     setLoading(true);
     try {
       const path = mode === "login" ? "/auth/login" : "/auth/register";
       const body =
         mode === "login"
           ? { email, password }
-          : { email, password, name: name || undefined };
+          : { email, password, name: name.trim() };
       const data = await apiFetch(path, {
         method: "POST",
         body: JSON.stringify(body),
@@ -83,9 +87,10 @@ export default function LoginPage() {
           {mode === "register" && (
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
-                Nom (optionnel)
+                Nom *
               </label>
               <input
+                required
                 className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
