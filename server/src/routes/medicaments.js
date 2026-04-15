@@ -154,6 +154,26 @@ function splitNameAndDosage(rawLine) {
   return { nom, dosage };
 }
 
+function parseEquivalentCell(rawCell) {
+  const raw = cleanText(rawCell);
+  if (!raw) return [];
+  return raw
+    .split("|")
+    .map((part) => cleanText(part))
+    .filter(Boolean)
+    .map((part) => {
+      const match = part.match(/^(.*?)\s*\[(\d{8,14})\]\s*$/);
+      if (!match) {
+        return { code: "", nom: part };
+      }
+      return {
+        code: cleanText(match[2]),
+        nom: cleanText(match[1]),
+      };
+    })
+    .filter((row) => row.nom || row.code);
+}
+
 function readFieldFromRow(row, aliases) {
   if (!row || typeof row !== "object") return "";
   const entries = Object.entries(row);
@@ -178,12 +198,16 @@ function parseMedicationRow(row) {
       "barcode",
       "code barre",
       "code_barre",
+      "code_barres",
+      "code ean 13",
     ])
   );
   const rawName = cleanText(
     readFieldFromRow(row, [
       "name",
       "nom",
+      "nom commercial",
+      "nom_commercial",
       "medicament",
       "nom medicament",
       "nom_medicament",
@@ -207,6 +231,9 @@ function parseMedicationRow(row) {
   const principle = cleanText(
     readFieldFromRow(row, ["composition", "composants", "principe actif", "principe_actif", "dci", "dci1"])
   );
+  const equivalents = parseEquivalentCell(
+    readFieldFromRow(row, ["equivalents", "equivalences", "equivalent", "équivalents"])
+  );
   const fullName = cleanText(
     rawName ||
       [rawName, dosage, readFieldFromRow(row, ["presentation", "forme"])]
@@ -221,6 +248,7 @@ function parseMedicationRow(row) {
     nom: cleanText(parsed.nom || rawName || fullName),
     dosage: cleanText(parsed.dosage || dosage),
     principeActif: principle,
+    equivalents,
   };
 }
 
@@ -255,6 +283,7 @@ function getXlsxSourceUrls() {
   const defaults = getCatalogBaseDirs().flatMap((baseDir) => [
     path.resolve(baseDir, "medicaments.xlsx"),
     path.resolve(baseDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
+    path.resolve(baseDir, "medicaments_organises.xlsx"),
   ]);
   const configured = String(process.env.CATALOG_XLSX_PATHS ?? "")
     .split(",")
@@ -353,6 +382,21 @@ async function readUnifiedCatalogSafe() {
       }))
     );
   }
+
+  const xlsxBuffers = await Promise.all(
+    getXlsxSourceUrls().map((filePath) => readArrayBufferFileSafe(filePath))
+  );
+  const xlsxRows = xlsxBuffers
+    .flatMap((buf) => (buf ? parseXlsxMedications(buf) : []))
+    .map((row) => ({
+      code: cleanText(row.code),
+      nom: cleanText(row.nom || row.fullName),
+      dosage: cleanText(row.dosage),
+      principeActif: cleanText(row.principeActif),
+      equivalents: Array.isArray(row.equivalents) ? row.equivalents : [],
+      source: "xlsx_local",
+    }));
+  if (xlsxRows.length > 0) mergedRows.push(...xlsxRows);
 
   const configured = String(process.env.CATALOG_UNIFIED_PATHS ?? "")
     .split(",")
@@ -681,14 +725,20 @@ function scoreCatalogMatch(query, row) {
     ...name
       .split(" ")
       .filter(Boolean)
-      .map((token) => 1 - levenshtein(nq, token) / Math.max(token.length, nq.length, 1))
+      .map((token) => {
+        const prefix = token.slice(0, Math.max(nq.length, 1));
+        return 1 - levenshtein(nq, prefix) / Math.max(prefix.length, nq.length, 1);
+      })
   );
   const paTokenMax = Math.max(
     0,
     ...pa
       .split(" ")
       .filter(Boolean)
-      .map((token) => 1 - levenshtein(nq, token) / Math.max(token.length, nq.length, 1))
+      .map((token) => {
+        const prefix = token.slice(0, Math.max(nq.length, 1));
+        return 1 - levenshtein(nq, prefix) / Math.max(prefix.length, nq.length, 1);
+      })
   );
   score += Math.max(nameTokenMax, paTokenMax) * 50;
   return score;
@@ -740,14 +790,20 @@ async function fetchLocalAndReferenceSuggestions(query) {
         ...name
           .split(" ")
           .filter(Boolean)
-          .map((token) => 1 - levenshtein(nq, token) / Math.max(token.length, nq.length, 1))
+          .map((token) => {
+            const prefix = token.slice(0, Math.max(nq.length, 1));
+            return 1 - levenshtein(nq, prefix) / Math.max(prefix.length, nq.length, 1);
+          })
       );
       const paTokenMax = Math.max(
         0,
         ...pa
           .split(" ")
           .filter(Boolean)
-          .map((token) => 1 - levenshtein(nq, token) / Math.max(token.length, nq.length, 1))
+          .map((token) => {
+            const prefix = token.slice(0, Math.max(nq.length, 1));
+            return 1 - levenshtein(nq, prefix) / Math.max(prefix.length, nq.length, 1);
+          })
       );
       score += Math.max(nameTokenMax, paTokenMax) * 60;
       if (nq.length >= 4 && Math.max(nameTokenMax, paTokenMax) >= 0.55) score += 20;

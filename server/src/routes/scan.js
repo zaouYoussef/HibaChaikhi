@@ -99,6 +99,25 @@ function normalizeCode(input) {
   return raw.replace(/[^a-zA-Z0-9]+/g, "").toUpperCase();
 }
 
+function extractBarcodeCandidates(input) {
+  const raw = String(input ?? "").trim();
+  if (!raw) return [];
+  const compact = raw.replace(/\s+/g, "");
+  const fromRegex = [...raw.matchAll(/\d{8,14}/g)].map((m) => normalizeCode(m[0]));
+  const direct = normalizeCode(compact);
+  const ordered = [];
+  const push = (value) => {
+    if (!value) return;
+    if (ordered.includes(value)) return;
+    ordered.push(value);
+  };
+  // Prefer EAN-13 first, then other lengths.
+  for (const value of fromRegex.filter((x) => x.length === 13)) push(value);
+  push(direct);
+  for (const value of fromRegex) push(value);
+  return ordered;
+}
+
 function normalizeOcrLines(input) {
   return String(input ?? "")
     .split(/\r?\n/g)
@@ -144,6 +163,24 @@ function splitNameAndDosage(rawLine) {
   return { nom, dosage };
 }
 
+function parseEquivalentCell(rawCell) {
+  const raw = cleanText(rawCell);
+  if (!raw) return [];
+  return raw
+    .split("|")
+    .map((part) => cleanText(part))
+    .filter(Boolean)
+    .map((part) => {
+      const match = part.match(/^(.*?)\s*\[(\d{8,14})\]\s*$/);
+      if (!match) return { code: "", nom: part };
+      return {
+        code: cleanText(match[2]),
+        nom: cleanText(match[1]),
+      };
+    })
+    .filter((row) => row.nom || row.code);
+}
+
 function getTaawidatySourceUrls() {
   const bases = getCatalogBaseDirs();
   const defaults = bases.flatMap((baseDir) => [
@@ -164,6 +201,7 @@ function getOdooSourceUrls() {
   const defaults = bases.flatMap((baseDir) => [
     path.resolve(baseDir, "medicaments.xlsx"),
     path.resolve(baseDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
+    path.resolve(baseDir, "medicaments_organises.xlsx"),
   ]);
   const configured = String(process.env.CATALOG_XLSX_PATHS ?? "")
     .split(",")
@@ -211,6 +249,23 @@ async function readUnifiedCatalogSafe() {
   const mergedRows = [];
   const dataRows = await readDataTxtCatalogSafe(dataTxtPaths);
   if (dataRows.length > 0) mergedRows.push(...dataRows);
+
+  const xlsxBuffers = await Promise.all(
+    getOdooSourceUrls().map((filePath) => readArrayBufferFileSafe(filePath))
+  );
+  const xlsxRows = xlsxBuffers
+    .flatMap((buf) => (buf ? parseXlsxMedications(buf) : []))
+    .map((entry) => ({
+      code: normalizeCode(entry?.code),
+      fullName: cleanText(entry?.fullName || entry?.nom),
+      nom: cleanText(entry?.nom),
+      dosage: cleanText(entry?.dosage),
+      principeActif: cleanText(entry?.principeActif),
+      equivalents: Array.isArray(entry?.equivalents) ? entry.equivalents : [],
+    }))
+    .filter((entry) => entry.nom || entry.fullName);
+  if (xlsxRows.length > 0) mergedRows.push(...xlsxRows);
+
   const configured = String(process.env.CATALOG_UNIFIED_PATHS ?? "")
     .split(",")
     .map((x) => x.trim())
@@ -527,12 +582,16 @@ function parseMedicationRow(row) {
       "barcode",
       "code barre",
       "code_barre",
+      "code_barres",
+      "code ean 13",
     ])
   );
   const rawName = cleanText(
     readFieldFromRow(row, [
       "name",
       "nom",
+      "nom commercial",
+      "nom_commercial",
       "medicament",
       "nom medicament",
       "nom_medicament",
@@ -545,6 +604,9 @@ function parseMedicationRow(row) {
   );
   const principle = cleanText(
     readFieldFromRow(row, ["composition", "principe actif", "principe_actif", "dci"])
+  );
+  const equivalents = parseEquivalentCell(
+    readFieldFromRow(row, ["equivalents", "equivalences", "equivalent", "équivalents"])
   );
   const fullName = cleanText(
     rawName ||
@@ -560,6 +622,7 @@ function parseMedicationRow(row) {
     nom: parsed.nom || rawName || fullName,
     dosage: parsed.dosage || dosage || "",
     principeActif: principle,
+    equivalents,
   };
 }
 
@@ -1538,20 +1601,32 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: parsed.error.flatten() });
   }
 
-  const code = parsed.data.code_barre.replace(/\s+/g, "");
+  const codeInput = parsed.data.code_barre;
+  const codeCandidates = extractBarcodeCandidates(codeInput);
+  const code = codeCandidates[0] || codeInput.replace(/\s+/g, "");
 
-  const local = await prisma.medicament.findFirst({
-    where: {
-      codeBarre: { equals: code },
-    },
-    include: {
-      lots: {
-        where: { quantite: { gt: 0 } },
-        orderBy: { dateExpiration: "asc" },
+  let local = null;
+  for (const candidate of codeCandidates.length > 0 ? codeCandidates : [code]) {
+    // eslint-disable-next-line no-await-in-loop
+    local = await prisma.medicament.findFirst({
+      where: {
+        codeBarre: { equals: candidate },
       },
-    },
-  });
-  const catalogHit = await lookupTaawidatyByCode(code);
+      include: {
+        lots: {
+          where: { quantite: { gt: 0 } },
+          orderBy: { dateExpiration: "asc" },
+        },
+      },
+    });
+    if (local) break;
+  }
+  let catalogHit = null;
+  for (const candidate of codeCandidates.length > 0 ? codeCandidates : [code]) {
+    // eslint-disable-next-line no-await-in-loop
+    catalogHit = await lookupTaawidatyByCode(candidate);
+    if (catalogHit) break;
+  }
 
   if (local) {
     const equivalents = (catalogHit?.equivalents ?? [])

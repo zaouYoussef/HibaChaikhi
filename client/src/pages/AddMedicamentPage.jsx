@@ -60,6 +60,18 @@ function splitCommercialNameAndDosage(rawName, rawDosage) {
   return { nom, dosage };
 }
 
+function extractBestBarcodeCandidate(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "";
+  const compact = text.replace(/\s+/g, "");
+  const exact = compact.match(/^\d{8,14}$/)?.[0];
+  if (exact) return exact;
+  const candidates = [...text.matchAll(/\d{8,14}/g)].map((m) => m[0]);
+  if (candidates.length === 0) return compact;
+  const ean13 = candidates.find((c) => c.length === 13);
+  return ean13 || candidates.sort((a, b) => b.length - a.length)[0];
+}
+
 export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
@@ -172,7 +184,7 @@ export default function AddMedicamentPage() {
 
   const onScan = useCallback(async (text) => {
     const scanned = text.trim();
-    const normalizedCode = scanned.replace(/\s+/g, "");
+    const normalizedCode = extractBestBarcodeCandidate(scanned);
     setScanOpen(false);
     try {
       const payload = await apiFetch("/scan", {

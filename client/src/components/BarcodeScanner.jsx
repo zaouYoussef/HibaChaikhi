@@ -13,6 +13,10 @@ const MEDICATION_FORMATS = [
   Html5QrcodeSupportedFormats.UPC_A,
   Html5QrcodeSupportedFormats.UPC_E,
   Html5QrcodeSupportedFormats.CODE_128,
+  Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.CODE_93,
+  Html5QrcodeSupportedFormats.ITF,
+  Html5QrcodeSupportedFormats.CODABAR,
 ];
 
 async function pickCameraIdOrConstraints() {
@@ -114,14 +118,14 @@ export default function BarcodeScanner({ onDetected, onClose }) {
             {
               fps: 20,
               /**
-               * Zone de scan carrée (centrée par la lib) : adaptée aux QR.
-               * Les codes-barres 1D : placez la bande au milieu du carré.
+               * Zone plus large que haute: meilleure détection des codes-barres 1D.
+               * Les QR restent lisibles car la zone reste centrée et suffisamment grande.
                */
               qrbox: (vw, vh) => {
                 const minEdge = Math.min(vw, vh);
-                let side = Math.floor(minEdge * 0.72);
-                side = Math.max(160, Math.min(side, minEdge - 12));
-                return { width: side, height: side };
+                const width = Math.max(220, Math.min(Math.floor(vw * 0.9), vw - 16));
+                const height = Math.max(120, Math.min(Math.floor(minEdge * 0.42), vh - 16));
+                return { width, height };
               },
               disableFlip: false,
             },
