@@ -715,6 +715,26 @@ function fuzzyScore(query, med) {
   return best;
 }
 
+function extractDosageFromQuery(query) {
+  const raw = cleanText(query);
+  if (!raw) return "";
+  const dosageRegex =
+    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%))?/i;
+  return cleanText(raw.match(dosageRegex)?.[0]);
+}
+
+function removeDosageFromQuery(query) {
+  const raw = cleanText(query);
+  if (!raw) return "";
+  const dosageRegex =
+    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%))?/i;
+  return cleanText(raw.replace(dosageRegex, " ")).replace(/[-,;:]+$/g, "");
+}
+
+function normalizeDosageForCompare(value) {
+  return normalizeForMatch(value).replace(/\s+/g, "");
+}
+
 function scoreCatalogMatch(query, row) {
   const nq = normalizeForMatch(query);
   if (!nq) return 0;
@@ -934,6 +954,58 @@ export async function searchMedicaments(req, res) {
       ),
       requestedQuery: q,
     });
+  }
+
+  const requestedDosage = extractDosageFromQuery(q);
+  const queryWithoutDosage = removeDosageFromQuery(q);
+  const requestedDosageNormalized = normalizeDosageForCompare(requestedDosage);
+  if (queryWithoutDosage && requestedDosageNormalized) {
+    const sameMedicationRows = await prisma.medicament.findMany({
+      where: {
+        OR: [
+          { nom: startsWithInsensitive(queryWithoutDosage) },
+          { nom: containsInsensitive(queryWithoutDosage) },
+        ],
+      },
+      include: { lots: true },
+      take: 80,
+    });
+    const sameMedicationAvailableLots = sameMedicationRows
+      .flatMap((m) =>
+        (m.lots ?? [])
+          .filter((lot) => lot.quantite > 0)
+          .map((lot) => ({ medicament: m, lot }))
+      )
+      .filter(
+        ({ medicament }) =>
+          normalizeDosageForCompare(medicament.dosage) !== requestedDosageNormalized
+      )
+      .sort(
+        (a, b) =>
+          new Date(a.lot.dateExpiration).getTime() -
+          new Date(b.lot.dateExpiration).getTime()
+      );
+
+    if (sameMedicationAvailableLots.length > 0) {
+      const recommended = sameMedicationAvailableLots[0];
+      const alternatives = [];
+      const seenAlternativeIds = new Set();
+      for (const { medicament, lot } of sameMedicationAvailableLots) {
+        if (seenAlternativeIds.has(medicament.id)) continue;
+        seenAlternativeIds.add(medicament.id);
+        alternatives.push(mapMed(medicament, lot));
+      }
+      return res.json({
+        status: "equivalent_disponible",
+        message: `Le dosage demandé (${requestedDosage}) n'est pas disponible. Vous pouvez prendre ${recommended.medicament.nom} ${recommended.medicament.dosage}.`,
+        recommended: mapMed(recommended.medicament, recommended.lot),
+        items: sameMedicationAvailableLots.map(({ medicament, lot }) =>
+          mapMed(medicament, lot)
+        ),
+        equivalents: alternatives,
+        requestedQuery: q,
+      });
+    }
   }
 
   const principles = new Set(
