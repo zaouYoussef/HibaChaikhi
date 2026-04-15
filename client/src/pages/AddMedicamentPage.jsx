@@ -72,6 +72,29 @@ function extractBestBarcodeCandidate(raw) {
   return ean13 || candidates.sort((a, b) => b.length - a.length)[0];
 }
 
+function formatExpiryInput(raw) {
+  const digits = String(raw ?? "")
+    .replace(/\D+/g, "")
+    .slice(0, 4);
+  if (digits.length <= 2) return digits;
+  return `${digits.slice(0, 2)}/${digits.slice(2)}`;
+}
+
+function parseExpiryMonthYearToIso(value) {
+  const trimmed = String(value ?? "").trim();
+  const match = trimmed.match(/^(\d{2})\/(\d{2})$/);
+  if (!match) return null;
+  const month = Number(match[1]);
+  const year2 = Number(match[2]);
+  if (month < 1 || month > 12) return null;
+  const fullYear = 2000 + year2;
+  const lastDay = new Date(fullYear, month, 0);
+  if (Number.isNaN(lastDay.getTime())) return null;
+  return new Date(
+    Date.UTC(fullYear, month - 1, lastDay.getDate(), 12, 0, 0, 0)
+  ).toISOString();
+}
+
 export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
@@ -247,6 +270,15 @@ export default function AddMedicamentPage() {
     setMsg({ type: "", text: "" });
     setLoading(true);
     try {
+      const parsedExpiration = parseExpiryMonthYearToIso(form.dateExpiration);
+      if (!parsedExpiration) {
+        setMsg({
+          type: "err",
+          text: "Date d’expiration invalide. Utilisez le format MM/YY (ex: 08/26).",
+        });
+        setLoading(false);
+        return;
+      }
       await apiFetch("/medicaments", {
         method: "POST",
         body: JSON.stringify({
@@ -255,7 +287,7 @@ export default function AddMedicamentPage() {
           dosage: form.dosage.trim(),
           numeroLot: form.numeroLot.trim(),
           quantite: Number(form.quantite),
-          dateExpiration: form.dateExpiration,
+          dateExpiration: parsedExpiration,
         }),
       });
       setMsg({ type: "ok", text: "Médicament enregistré." });
@@ -439,10 +471,18 @@ export default function AddMedicamentPage() {
           </label>
           <input
             required
-            type="month"
+            type="text"
+            inputMode="numeric"
+            pattern="^(0[1-9]|1[0-2])\/\d{2}$"
             className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm max-w-[220px]"
             value={form.dateExpiration}
-            onChange={(e) => update("dateExpiration", e.target.value)}
+            onChange={(e) =>
+              update("dateExpiration", formatExpiryInput(e.target.value))
+            }
+            onBlur={(e) =>
+              update("dateExpiration", formatExpiryInput(e.target.value))
+            }
+            placeholder="MM/YY (ex: 08/26)"
           />
         </div>
 
