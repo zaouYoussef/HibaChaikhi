@@ -2,6 +2,10 @@ import { Router } from "express";
 import { z } from "zod";
 import { load } from "cheerio";
 import { createWorker } from "tesseract.js";
+import * as XLSX from "xlsx";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { prisma } from "../lib/prisma.js";
 
 const router = Router();
@@ -14,6 +18,13 @@ const imageScanSchema = z.object({
 });
 
 let ocrWorkerPromise = null;
+let taawidatyCache = {
+  expiresAt: 0,
+  rows: [],
+};
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRootDir = path.resolve(__dirname, "..", "..", "..");
 
 function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
@@ -54,6 +65,10 @@ function normalizeText(input) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+}
+
+function normalizeCode(input) {
+  return String(input ?? "").replace(/\s+/g, "").trim();
 }
 
 function normalizeOcrLines(input) {
@@ -99,6 +114,235 @@ function splitNameAndDosage(rawLine) {
   if (idx <= 0) return { nom: line, dosage };
   const nom = cleanText(line.slice(0, idx)).replace(/[-,;:\s]+$/g, "");
   return { nom, dosage };
+}
+
+function getTaawidatySourceUrls() {
+  const configured = String(process.env.CATALOG_JSON_PATHS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (configured.length > 0) return configured;
+  return [
+    path.resolve(projectRootDir, "medications-cnops.json"),
+    path.resolve(projectRootDir, "medications-cnss.json"),
+  ];
+}
+
+function getOdooSourceUrls() {
+  const configured = String(process.env.CATALOG_XLSX_PATHS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (configured.length > 0) return configured;
+  return [
+    path.resolve(projectRootDir, "medicaments.xlsx"),
+    path.resolve(projectRootDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
+  ];
+}
+
+async function readJsonFileSafe(filePath) {
+  try {
+    const raw = await readFile(filePath, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function readArrayBufferFileSafe(filePath) {
+  try {
+    const buf = await readFile(filePath);
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  } catch {
+    return null;
+  }
+}
+
+function readFieldFromRow(row, aliases) {
+  if (!row || typeof row !== "object") return "";
+  const entries = Object.entries(row);
+  for (const [key, value] of entries) {
+    const nk = normalizeForMatch(key);
+    if (!nk) continue;
+    if (aliases.some((alias) => nk === normalizeForMatch(alias))) {
+      return cleanText(value);
+    }
+  }
+  return "";
+}
+
+function parseMedicationRow(row) {
+  const code = normalizeCode(
+    readFieldFromRow(row, [
+      "code",
+      "cip",
+      "ean",
+      "barcode",
+      "code barre",
+      "code_barre",
+    ])
+  );
+  const rawName = cleanText(
+    readFieldFromRow(row, [
+      "name",
+      "nom",
+      "medicament",
+      "nom medicament",
+      "nom_medicament",
+      "specialite",
+      "libelle",
+    ])
+  );
+  const dosage = cleanText(
+    readFieldFromRow(row, ["dosage", "presentation", "forme", "unit_dosage", "unite dosage"])
+  );
+  const principle = cleanText(
+    readFieldFromRow(row, ["composition", "principe actif", "principe_actif", "dci"])
+  );
+  const fullName = cleanText(rawName || [rawName, dosage].filter(Boolean).join(" "));
+  if (!fullName) return null;
+  const parsed = splitNameAndDosage(fullName);
+  return {
+    code,
+    fullName,
+    nom: parsed.nom || rawName || fullName,
+    dosage: parsed.dosage || dosage || "",
+    principeActif: principle,
+  };
+}
+
+function parseXlsxMedications(arrayBuffer) {
+  try {
+    const workbook = XLSX.read(Buffer.from(arrayBuffer), { type: "buffer" });
+    const firstSheetName = workbook?.SheetNames?.[0];
+    if (!firstSheetName) return [];
+    const sheet = workbook.Sheets[firstSheetName];
+    if (!sheet) return [];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+    return rows.map(parseMedicationRow).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function loadTaawidatyCatalog() {
+  const now = Date.now();
+  if (taawidatyCache.rows.length > 0 && taawidatyCache.expiresAt > now) {
+    return taawidatyCache.rows;
+  }
+  const taawidatyUrls = getTaawidatySourceUrls();
+  const taawidatyBatches = await Promise.all(
+    taawidatyUrls.map((filePath) => readJsonFileSafe(filePath))
+  );
+  const taawidatyRows = taawidatyBatches
+    .flatMap((batch) => (Array.isArray(batch) ? batch : []))
+    .map((entry) => {
+      const code = normalizeCode(entry?.code);
+      const fullName = cleanText(entry?.name);
+      if (!fullName) return null;
+      const parsed = splitNameAndDosage(fullName);
+      return {
+        code,
+        fullName,
+        nom: parsed.nom || fullName,
+        dosage: parsed.dosage || "",
+        principeActif: "",
+      };
+    })
+    .filter(Boolean);
+
+  const odooUrls = getOdooSourceUrls();
+  const odooBuffers = await Promise.all(
+    odooUrls.map((filePath) => readArrayBufferFileSafe(filePath))
+  );
+  const odooRows = odooBuffers
+    .flatMap((buf) => (buf ? parseXlsxMedications(buf) : []))
+    .map((entry) => {
+      const fullName = cleanText(entry?.fullName || entry?.nom);
+      if (!fullName) return null;
+      return {
+        code: normalizeCode(entry?.code),
+        fullName,
+        nom: cleanText(entry?.nom) || splitNameAndDosage(fullName).nom || fullName,
+        dosage: cleanText(entry?.dosage),
+        principeActif: cleanText(entry?.principeActif),
+      };
+    })
+    .filter(Boolean);
+  const rows = [...taawidatyRows, ...odooRows];
+
+  const dedup = new Map();
+  for (const row of rows) {
+    const key = `${normalizeText(row.code)}|${normalizeText(row.fullName)}`;
+    if (!dedup.has(key)) dedup.set(key, row);
+  }
+  taawidatyCache = {
+    rows: [...dedup.values()],
+    expiresAt: now + 12 * 60 * 60 * 1000,
+  };
+  return taawidatyCache.rows;
+}
+
+async function lookupTaawidatyByCode(code) {
+  const normalized = normalizeCode(code);
+  if (!normalized) return null;
+  const catalog = await loadTaawidatyCatalog();
+  return catalog.find((row) => row.code && row.code === normalized) || null;
+}
+
+async function inferFromTaawidatyCatalog(ocrText) {
+  const normalizedOcr = normalizeForMatch(ocrText);
+  const ocrTokens = new Set(tokenize(ocrText));
+  if (!normalizedOcr || ocrTokens.size === 0) return null;
+  const dosageCandidates = extractDosageCandidates(ocrText).map((d) =>
+    normalizeForMatch(d)
+  );
+  const catalog = await loadTaawidatyCatalog();
+  let best = null;
+  let bestScore = 0;
+  for (const item of catalog) {
+    const nameTokens = tokenize(item.nom);
+    if (nameTokens.length === 0) continue;
+    const tokenHits = nameTokens.reduce(
+      (sum, token) => sum + (ocrTokens.has(token) ? 1 : 0),
+      0
+    );
+    const tokenRatio = tokenHits / Math.max(nameTokens.length, 1);
+    const itemNameNorm = normalizeForMatch(item.nom);
+    const itemDosageNorm = normalizeForMatch(item.dosage);
+
+    let score = tokenHits * 2;
+    if (itemNameNorm && normalizedOcr.includes(itemNameNorm)) score += 10;
+    if (tokenRatio >= 0.6) score += 6;
+    if (
+      itemDosageNorm &&
+      dosageCandidates.some(
+        (cand) =>
+          cand &&
+          (cand.includes(itemDosageNorm) || itemDosageNorm.includes(cand))
+      )
+    ) {
+      score += 6;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (!best || bestScore < 8) return null;
+  return {
+    status: "partial",
+    confidence: Math.min(0.86, Number((bestScore / 22).toFixed(2))),
+    medicament: {
+      nom: best.nom,
+      principeActif: "",
+      dosage: best.dosage || extractDosageCandidates(ocrText)[0] || "",
+      source: "vision_ocr_taawidaty",
+    },
+    equivalents: [],
+    message:
+      "Nom détecté via catalogue TAAWIDATY. Vérifiez puis complétez si nécessaire.",
+  };
 }
 
 function pickBestMedicationLine(ocrText) {
@@ -739,6 +983,11 @@ async function inferMedicationFromOcrText(ocrText) {
       };
     }
 
+    const taawidatyMatch = await inferFromTaawidatyCatalog(ocrText);
+    if (taawidatyMatch?.medicament?.nom) {
+      return taawidatyMatch;
+    }
+
     return {
       status: "not_found",
       confidence: 0,
@@ -962,49 +1211,20 @@ router.post("/", async (req, res) => {
     });
   }
 
-  const moroccoApi = await fetchMedicamentsMoroccoByBarcode(code);
-  if (moroccoApi) {
-    const needsEnrichment =
-      !cleanText(moroccoApi.principeActif) || !cleanText(moroccoApi.dosage);
-    let merged = { ...moroccoApi };
-
-    if (needsEnrichment) {
-      const dataGovFallback = await fetchDataGovMaByBarcode(code);
-      if (dataGovFallback) {
-        merged = {
-          ...merged,
-          principeActif: cleanText(merged.principeActif) || dataGovFallback.principeActif,
-          dosage: cleanText(merged.dosage) || dataGovFallback.dosage,
-          source: "medicaments_morocco+data_gov_ma",
-        };
-      }
-    }
-
-    const enriched = await enrichPrincipleFromWeb(merged);
+  const taawidatyHit = await lookupTaawidatyByCode(code);
+  if (taawidatyHit) {
     return res.json({
       status: "external",
       code_barre: code,
-      querySuggestion: enriched.nom,
+      querySuggestion: taawidatyHit.nom,
       medicament: {
-        ...enriched,
+        nom: taawidatyHit.nom,
+        dosage: taawidatyHit.dosage || "",
         principeActif:
-          cleanText(enriched.principeActif) || "Principe actif non renseigné",
+          cleanText(taawidatyHit.principeActif) || "Principe actif non renseigné",
+        source: "local_catalog",
       },
-      message: needsEnrichment
-        ? "Résultat récupéré via medicament.ma (complété si possible par data.gov.ma)"
-        : "Résultat récupéré via medicament.ma",
-    });
-  }
-
-  const dataGovApi = await fetchDataGovMaByBarcode(code);
-  if (dataGovApi) {
-    const enriched = await enrichPrincipleFromWeb(dataGovApi);
-    return res.json({
-      status: "external",
-      code_barre: code,
-      querySuggestion: enriched.nom,
-      medicament: enriched,
-      message: "Résultat récupéré via data.gov.ma",
+      message: "Résultat récupéré via catalogue local (Excel/JSON)",
     });
   }
 
@@ -1014,7 +1234,7 @@ router.post("/", async (req, res) => {
     querySuggestion: code,
     medicament: null,
     message:
-      "Aucun résultat trouvé sur medicament.ma / data.gov.ma. Utilisez la saisie manuelle.",
+      "Aucun résultat trouvé dans la base locale et les fichiers catalogue.",
   });
 });
 
