@@ -38,6 +38,7 @@ const medicamentCreateSchema = z.object({
   quantite: z.coerce.number().int().min(0, "Quantité >= 0"),
   dateExpiration: z.coerce.date({ invalid_type_error: "Date invalide" }),
   codeBarre: z.string().max(120).optional().nullable(),
+  equivalentNames: z.array(z.string().min(1).max(300)).optional().default([]),
 });
 
 function containsInsensitive(value) {
@@ -1066,6 +1067,7 @@ router.post("/", async (req, res) => {
     quantite,
     dateExpiration,
     codeBarre,
+    equivalentNames,
   } = parsed.data;
   const lotValue =
     numeroLot?.trim() ||
@@ -1125,9 +1127,14 @@ router.post("/", async (req, res) => {
     select: { nom: true },
     take: 200,
   });
-  for (const candidate of samePrincipleMeds) {
+  const suggestedNames = [...new Set((equivalentNames ?? []).map((x) => cleanText(x)).filter(Boolean))];
+  const allEquivalentNames = [
+    ...samePrincipleMeds.map((m) => cleanText(m.nom)),
+    ...suggestedNames,
+  ];
+  for (const equivalentName of allEquivalentNames) {
     // eslint-disable-next-line no-await-in-loop
-    await ensureEquivalentReference(principeActif, candidate.nom);
+    await ensureEquivalentReference(principeActif, equivalentName);
   }
 
   res.status(201).json(summarizeMedicament(result));
