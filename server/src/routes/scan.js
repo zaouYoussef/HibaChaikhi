@@ -8,6 +8,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PDFParse } from "pdf-parse";
 import { prisma } from "../lib/prisma.js";
+import {
+  getDataTxtSourcePaths,
+  readDataTxtCatalogSafe,
+} from "../lib/dataTxtCatalog.js";
 
 const router = Router();
 
@@ -26,6 +30,25 @@ let taawidatyCache = {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRootDir = path.resolve(__dirname, "..", "..", "..");
+const serverRootDir = path.resolve(__dirname, "..", "..");
+const unifiedCatalogPaths = [
+  path.resolve(projectRootDir, "catalog-local-unified.json"),
+  path.resolve(serverRootDir, "catalog-local-unified.json"),
+];
+const dataTxtPaths = getDataTxtSourcePaths(
+  getCatalogBaseDirs(),
+  process.env.CATALOG_DATA_TXT_PATHS
+);
+
+function getCatalogBaseDirs() {
+  const fromEnv = String(process.env.CATALOG_BASE_DIRS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .map((p) => path.resolve(p));
+  const bases = [projectRootDir, serverRootDir, process.cwd(), ...fromEnv].filter(Boolean);
+  return [...new Set(bases)];
+}
 
 function cleanText(input) {
   return String(input ?? "").replace(/\s+/g, " ").trim();
@@ -69,7 +92,11 @@ function normalizeText(input) {
 }
 
 function normalizeCode(input) {
-  return String(input ?? "").replace(/\s+/g, "").trim();
+  const raw = String(input ?? "").trim();
+  if (!raw) return "";
+  const digitsOnly = raw.replace(/\D+/g, "");
+  if (digitsOnly.length >= 6) return digitsOnly;
+  return raw.replace(/[^a-zA-Z0-9]+/g, "").toUpperCase();
 }
 
 function normalizeOcrLines(input) {
@@ -118,11 +145,12 @@ function splitNameAndDosage(rawLine) {
 }
 
 function getTaawidatySourceUrls() {
-  const defaults = [
-    path.resolve(projectRootDir, "medications-cnops.json"),
-    path.resolve(projectRootDir, "medications-cnss.json"),
-    path.resolve(projectRootDir, "allmeds.json"),
-  ];
+  const bases = getCatalogBaseDirs();
+  const defaults = bases.flatMap((baseDir) => [
+    path.resolve(baseDir, "medications-cnops.json"),
+    path.resolve(baseDir, "medications-cnss.json"),
+    path.resolve(baseDir, "allmeds.json"),
+  ]);
   const configured = String(process.env.CATALOG_JSON_PATHS ?? "")
     .split(",")
     .map((x) => x.trim())
@@ -132,10 +160,11 @@ function getTaawidatySourceUrls() {
 }
 
 function getOdooSourceUrls() {
-  const defaults = [
-    path.resolve(projectRootDir, "medicaments.xlsx"),
-    path.resolve(projectRootDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
-  ];
+  const bases = getCatalogBaseDirs();
+  const defaults = bases.flatMap((baseDir) => [
+    path.resolve(baseDir, "medicaments.xlsx"),
+    path.resolve(baseDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
+  ]);
   const configured = String(process.env.CATALOG_XLSX_PATHS ?? "")
     .split(",")
     .map((x) => x.trim())
@@ -152,14 +181,21 @@ async function getPdfSourceUrls() {
   if (configured.length > 0) {
     return [...new Set(configured)];
   }
-  try {
-    const names = await readdir(projectRootDir);
-    return names
-      .filter((name) => name.toLowerCase().endsWith(".pdf"))
-      .map((name) => path.resolve(projectRootDir, name));
-  } catch {
-    return [];
+  const bases = getCatalogBaseDirs();
+  const out = [];
+  for (const baseDir of bases) {
+    try {
+      const names = await readdir(baseDir);
+      out.push(
+        ...names
+          .filter((name) => name.toLowerCase().endsWith(".pdf"))
+          .map((name) => path.resolve(baseDir, name))
+      );
+    } catch {
+      // ignore missing directories
+    }
   }
+  return [...new Set(out)];
 }
 
 async function readJsonFileSafe(filePath) {
@@ -169,6 +205,57 @@ async function readJsonFileSafe(filePath) {
   } catch {
     return null;
   }
+}
+
+async function readUnifiedCatalogSafe() {
+  const mergedRows = [];
+  const dataRows = await readDataTxtCatalogSafe(dataTxtPaths);
+  if (dataRows.length > 0) mergedRows.push(...dataRows);
+  const configured = String(process.env.CATALOG_UNIFIED_PATHS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const candidatePaths = [...new Set([...configured, ...unifiedCatalogPaths])];
+  for (const filePath of candidatePaths) {
+    const content = await readJsonFileSafe(filePath);
+    if (!Array.isArray(content) || content.length === 0) continue;
+    const normalized = content
+      .map((entry) => ({
+        code: normalizeCode(entry?.code),
+        fullName: cleanText(entry?.fullName || entry?.nom),
+        nom: cleanText(entry?.nom),
+        dosage: cleanText(entry?.dosage),
+        principeActif: cleanText(entry?.principeActif),
+        equivalents: [],
+      }))
+      .filter((entry) => entry.nom || entry.fullName);
+    if (normalized.length > 0) mergedRows.push(...normalized);
+  }
+  if (mergedRows.length === 0) return [];
+
+  const dedup = new Map();
+  for (const row of mergedRows) {
+    const key = row.code
+      ? `code:${normalizeCode(row.code)}`
+      : `${normalizeText(row.nom)}|${normalizeText(row.dosage)}|${normalizeText(
+          row.principeActif
+        )}`;
+    if (!key) continue;
+    const existing = dedup.get(key);
+    if (!existing || scoreCatalogRowQuality(row) > scoreCatalogRowQuality(existing)) {
+      dedup.set(key, row);
+      continue;
+    }
+    if (
+      Array.isArray(existing.equivalents) &&
+      existing.equivalents.length === 0 &&
+      Array.isArray(row.equivalents) &&
+      row.equivalents.length > 0
+    ) {
+      existing.equivalents = row.equivalents;
+    }
+  }
+  return [...dedup.values()];
 }
 
 async function readArrayBufferFileSafe(filePath) {
@@ -209,10 +296,11 @@ function getRmmgSourceUrls() {
     .map((x) => x.trim())
     .filter(Boolean);
   if (configured.length > 0) return configured;
-  return [
-    path.resolve(projectRootDir, "rmmg-ammps-2026.txt"),
-    path.resolve(projectRootDir, "rmmg-ammps-2026.pdf.txt"),
-  ];
+  const bases = getCatalogBaseDirs();
+  return [...new Set(bases.flatMap((baseDir) => [
+    path.resolve(baseDir, "rmmg-ammps-2026.txt"),
+    path.resolve(baseDir, "rmmg-ammps-2026.pdf.txt"),
+  ]))];
 }
 
 function parseRmmgText(rawText) {
@@ -321,6 +409,100 @@ function parseRmmgText(rawText) {
   return entries;
 }
 
+function parseAnamGuideText(rawText) {
+  const lines = String(rawText ?? "")
+    .split(/\r?\n/g)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const headerPatterns = [
+    /^code ean/i,
+    /^classement par/i,
+    /^guide des medicaments/i,
+    /^assurance maladie obligatoire/i,
+    /^version\s*:/i,
+    /^anam\s*-/i,
+    /^\d+\s*\/\s*\d+$/,
+  ];
+  const looksLikeHeader = (line) => {
+    const normalized = normalizeForMatch(line);
+    if (!normalized) return true;
+    return headerPatterns.some((rx) => rx.test(normalized));
+  };
+
+  const eanStartRegex = /^(\d{13})\b\s*(.*)$/;
+  const presentationRegex =
+    /\b\d+\s+(?:boite|flacon|bidon|ampoule|sachet|seringue|poche|tube|ovule|gelule|comprime|capsule|patch|cartouche|stylo|recipient|suppositoire|dose|kit|flexipoche)\b/i;
+  const formRegex =
+    /\b(comprime|gelule|capsule|poudre|solution|suspension|sirop|collyre|creme|pommade|ovule|suppositoire|granule|lyophilisat|dispositif|concentre|emulsion|gouttes|spray|aerosol|inhalation|injectable|perfusion|pulverisation|lotion)\b/i;
+  const dosageRegex =
+    /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%)\b(?:\s*\/\s*\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|ui|iu|mui|%))?/i;
+
+  const entries = [];
+  let current = null;
+
+  const flushCurrent = () => {
+    if (!current?.code) return;
+    const merged = cleanText(current.parts.join(" "));
+    if (!merged) return;
+
+    let core = merged;
+    const presentationMatch = core.match(presentationRegex);
+    if (presentationMatch?.index && presentationMatch.index > 0) {
+      core = cleanText(core.slice(0, presentationMatch.index));
+    }
+    core = core.replace(/\s+[PG]\s*$/i, "").trim();
+
+    const dosageMatch = core.match(dosageRegex);
+    const dosage = cleanText(dosageMatch?.[0]);
+    let beforeDosage = dosageMatch?.index
+      ? cleanText(core.slice(0, dosageMatch.index))
+      : core;
+    beforeDosage = beforeDosage.replace(/\s+[aà]$/i, "").trim();
+
+    const formMatch = beforeDosage.match(formRegex);
+    if (formMatch?.index && formMatch.index > 0) {
+      beforeDosage = cleanText(beforeDosage.slice(0, formMatch.index));
+    }
+
+    const nom = cleanText(beforeDosage || core);
+    if (!nom) return;
+    entries.push({
+      code: normalizeCode(current.code),
+      fullName: cleanText(core),
+      nom,
+      dosage,
+      principeActif: "",
+    });
+  };
+
+  for (const line of lines) {
+    if (looksLikeHeader(line)) continue;
+    const eanMatch = line.match(eanStartRegex);
+    if (eanMatch) {
+      flushCurrent();
+      current = { code: eanMatch[1], parts: [cleanText(eanMatch[2])] };
+      continue;
+    }
+    if (!current) continue;
+    current.parts.push(line);
+  }
+  flushCurrent();
+  return entries;
+}
+
+function scoreCatalogRowQuality(row) {
+  const nameLen = cleanText(row?.nom).length;
+  const principleLen = cleanText(row?.principeActif).length;
+  const dosageLen = cleanText(row?.dosage).length;
+  return (
+    (principleLen > 1 ? 30 : 0) +
+    (dosageLen > 1 ? 15 : 0) +
+    (nameLen > 0 ? Math.max(1, 20 - Math.floor(nameLen / 8)) : 0)
+  );
+}
+
 function readFieldFromRow(row, aliases) {
   if (!row || typeof row !== "object") return "";
   const entries = Object.entries(row);
@@ -338,7 +520,9 @@ function parseMedicationRow(row) {
   const code = normalizeCode(
     readFieldFromRow(row, [
       "code",
+      "id",
       "cip",
+      "ean13",
       "ean",
       "barcode",
       "code barre",
@@ -362,7 +546,12 @@ function parseMedicationRow(row) {
   const principle = cleanText(
     readFieldFromRow(row, ["composition", "principe actif", "principe_actif", "dci"])
   );
-  const fullName = cleanText(rawName || [rawName, dosage].filter(Boolean).join(" "));
+  const fullName = cleanText(
+    rawName ||
+      [rawName, dosage, readFieldFromRow(row, ["presentation", "forme"])]
+        .filter(Boolean)
+        .join(" ")
+  );
   if (!fullName) return null;
   const parsed = splitNameAndDosage(fullName);
   return {
@@ -393,23 +582,29 @@ async function loadTaawidatyCatalog() {
   if (taawidatyCache.rows.length > 0 && taawidatyCache.expiresAt > now) {
     return taawidatyCache.rows;
   }
+  const unifiedRows = await readUnifiedCatalogSafe();
+  if (unifiedRows.length > 0) {
+    taawidatyCache = {
+      rows: unifiedRows,
+      expiresAt: now + 12 * 60 * 60 * 1000,
+    };
+    return taawidatyCache.rows;
+  }
   const taawidatyUrls = getTaawidatySourceUrls();
   const taawidatyBatches = await Promise.all(
     taawidatyUrls.map((filePath) => readJsonFileSafe(filePath))
   );
   const taawidatyRows = taawidatyBatches
     .flatMap((batch) => (Array.isArray(batch) ? batch : []))
+    .map((entry) => parseMedicationRow(entry))
     .map((entry) => {
-      const code = normalizeCode(entry?.code);
-      const fullName = cleanText(entry?.name);
-      if (!fullName) return null;
-      const parsed = splitNameAndDosage(fullName);
+      if (!entry) return null;
       return {
-        code,
-        fullName,
-        nom: parsed.nom || fullName,
-        dosage: parsed.dosage || "",
-        principeActif: "",
+        code: normalizeCode(entry?.code),
+        fullName: cleanText(entry?.fullName || entry?.nom),
+        nom: cleanText(entry?.nom) || splitNameAndDosage(entry?.fullName).nom || "",
+        dosage: cleanText(entry?.dosage),
+        principeActif: cleanText(entry?.principeActif),
       };
     })
     .filter(Boolean);
@@ -439,7 +634,10 @@ async function loadTaawidatyCatalog() {
 
   const pdfUrls = await getPdfSourceUrls();
   const pdfTexts = await Promise.all(pdfUrls.map((filePath) => readPdfTextSafe(filePath)));
-  const pdfRows = pdfTexts.flatMap((text) => parseRmmgText(text));
+  const pdfRows = pdfTexts.flatMap((text) => [
+    ...parseRmmgText(text),
+    ...parseAnamGuideText(text),
+  ]);
 
   const rows = [...taawidatyRows, ...odooRows, ...rmmgRows, ...pdfRows];
 
@@ -459,7 +657,10 @@ async function lookupTaawidatyByCode(code) {
   const normalized = normalizeCode(code);
   if (!normalized) return null;
   const catalog = await loadTaawidatyCatalog();
-  return catalog.find((row) => row.code && row.code === normalized) || null;
+  const candidates = catalog
+    .filter((row) => row.code && row.code === normalized)
+    .sort((a, b) => scoreCatalogRowQuality(b) - scoreCatalogRowQuality(a));
+  return candidates[0] || null;
 }
 
 async function inferFromTaawidatyCatalog(ocrText) {
@@ -1341,11 +1542,7 @@ router.post("/", async (req, res) => {
 
   const local = await prisma.medicament.findFirst({
     where: {
-      OR: [
-        { codeBarre: { equals: code } },
-        { nom: { equals: code } },
-        { nom: { contains: code } },
-      ],
+      codeBarre: { equals: code },
     },
     include: {
       lots: {
@@ -1354,8 +1551,19 @@ router.post("/", async (req, res) => {
       },
     },
   });
+  const catalogHit = await lookupTaawidatyByCode(code);
 
   if (local) {
+    const equivalents = (catalogHit?.equivalents ?? [])
+      .filter((eq) => eq?.nom && eq?.code !== code)
+      .slice(0, 10)
+      .map((eq) => ({
+        nom: eq.nom,
+        codeBarres: eq.code || "",
+        principeActif: cleanText(catalogHit?.principeActif),
+        dosage: cleanText(catalogHit?.dosage),
+        source: "data_txt",
+      }));
     return res.json({
       status: "local",
       code_barre: code,
@@ -1368,24 +1576,35 @@ router.post("/", async (req, res) => {
         quantite: (local.lots ?? []).reduce((sum, lot) => sum + lot.quantite, 0),
         dateExpiration: local.lots?.[0]?.dateExpiration ?? null,
       },
+      equivalents,
       message: "Médicament trouvé dans la base locale",
     });
   }
 
-  const taawidatyHit = await lookupTaawidatyByCode(code);
-  if (taawidatyHit) {
+  if (catalogHit) {
+    const equivalents = (catalogHit.equivalents ?? [])
+      .filter((eq) => eq?.nom && eq?.code !== code)
+      .slice(0, 10)
+      .map((eq) => ({
+        nom: eq.nom,
+        codeBarres: eq.code || "",
+        principeActif: cleanText(catalogHit.principeActif),
+        dosage: cleanText(catalogHit.dosage),
+        source: "data_txt",
+      }));
     return res.json({
       status: "external",
       code_barre: code,
-      querySuggestion: taawidatyHit.nom,
+      querySuggestion: catalogHit.nom,
       medicament: {
-        nom: taawidatyHit.nom,
-        dosage: taawidatyHit.dosage || "",
+        nom: catalogHit.nom,
+        dosage: catalogHit.dosage || "",
         principeActif:
-          cleanText(taawidatyHit.principeActif) || "Principe actif non renseigné",
+          cleanText(catalogHit.principeActif) || "Principe actif non renseigné",
         source: "local_catalog",
       },
-      message: "Résultat récupéré via catalogue local (Excel/JSON/RMMG)",
+      equivalents,
+      message: "Résultat récupéré via data.txt (catalogue local fusionné)",
     });
   }
 

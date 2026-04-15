@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "start:railway": "npx prisma db push && node src/index.js",
+    "catalog:build": "node scripts/build-local-catalog.js",
+    "start:railway": "npx prisma db push && npm run catalog:build && node src/index.js",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
