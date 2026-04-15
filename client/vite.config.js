@@ -6,6 +6,8 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
+      // Force disable old PWA cache that can keep outdated UI on mobile.
+      selfDestroying: true,
       registerType: "autoUpdate",
       includeAssets: ["favicon.svg"],
       manifest: {
