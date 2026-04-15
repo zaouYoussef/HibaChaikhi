@@ -757,6 +757,21 @@ function buildQueryCandidates(query) {
   return uniqCompact([original, normalized]);
 }
 
+async function ensureEquivalentReference(principeActif, nomMedicament) {
+  const principe = cleanText(principeActif);
+  const nom = cleanText(nomMedicament);
+  if (!principe || !nom) return false;
+  const existing = await prisma.equivalent.findFirst({
+    where: { principeActif: principe, nomMedicament: nom },
+    select: { id: true },
+  });
+  if (existing) return false;
+  await prisma.equivalent.create({
+    data: { principeActif: principe, nomMedicament: nom },
+  });
+  return true;
+}
+
 async function fetchLocalAndReferenceSuggestions(query) {
   const candidates = uniqCompact([query, ...buildQueryCandidates(query)]).slice(0, 8);
   const localRows = await prisma.medicament.findMany({
@@ -1103,6 +1118,17 @@ router.post("/", async (req, res) => {
       include: { lots: true },
     });
   });
+
+  // Keep "equivalent" references synced automatically after each add.
+  const samePrincipleMeds = await prisma.medicament.findMany({
+    where: { principeActif: equalsInsensitive(principeActif) },
+    select: { nom: true },
+    take: 200,
+  });
+  for (const candidate of samePrincipleMeds) {
+    // eslint-disable-next-line no-await-in-loop
+    await ensureEquivalentReference(principeActif, candidate.nom);
+  }
 
   res.status(201).json(summarizeMedicament(result));
 });

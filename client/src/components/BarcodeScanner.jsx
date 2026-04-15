@@ -19,6 +19,17 @@ const MEDICATION_FORMATS = [
   Html5QrcodeSupportedFormats.CODABAR,
 ];
 
+function extractBestBarcodeCandidate(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "";
+  const compact = text.replace(/\s+/g, "");
+  if (/^\d{8,14}$/.test(compact)) return compact;
+  const candidates = [...text.matchAll(/\d{8,14}/g)].map((m) => m[0]);
+  if (candidates.length === 0) return compact;
+  const ean13 = candidates.find((c) => c.length === 13);
+  return ean13 || candidates.sort((a, b) => b.length - a.length)[0];
+}
+
 async function pickCameraIdOrConstraints() {
   try {
     const devices = await Html5Qrcode.getCameras();
@@ -69,6 +80,12 @@ export default function BarcodeScanner({ onDetected, onClose }) {
   const [err, setErr] = useState(null);
   const [starting, setStarting] = useState(true);
   const [cameraLive, setCameraLive] = useState(false);
+  const detectionStateRef = useRef({
+    lastNormalized: "",
+    sameCount: 0,
+    lastSeenAt: 0,
+    locked: false,
+  });
 
   async function safeStopAndClear(scanner) {
     if (!scanner) return;
@@ -116,7 +133,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
           scanner.start(
             cam,
             {
-              fps: 20,
+              fps: 14,
               /**
                * Zone plus large que haute: meilleure détection des codes-barres 1D.
                * Les QR restent lisibles car la zone reste centrée et suffisamment grande.
@@ -131,11 +148,34 @@ export default function BarcodeScanner({ onDetected, onClose }) {
             },
             (decodedText) => {
               if (cancelled) return;
+              const now = Date.now();
+              const state = detectionStateRef.current;
+              if (state.locked) return;
+              const normalized = extractBestBarcodeCandidate(decodedText);
+              if (!normalized) return;
+              // Keep only plausible barcode payloads (or QR containing barcode digits).
+              if (!/^\d{8,14}$/.test(normalized)) return;
+
+              const windowMs = 1600;
+              if (
+                state.lastNormalized === normalized &&
+                now - state.lastSeenAt <= windowMs
+              ) {
+                state.sameCount += 1;
+              } else {
+                state.lastNormalized = normalized;
+                state.sameCount = 1;
+              }
+              state.lastSeenAt = now;
+
+              // Require the same value twice before accepting.
+              if (state.sameCount < 2) return;
+              state.locked = true;
               const s = scannerRef.current;
               try {
                 if (s?.isScanning) s.pause(true);
               } catch {}
-              onDetectedRef.current?.(decodedText);
+              onDetectedRef.current?.(normalized);
             },
             () => {}
           );
