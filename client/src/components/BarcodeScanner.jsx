@@ -30,6 +30,36 @@ function extractBestBarcodeCandidate(raw) {
   return ean13 || candidates.sort((a, b) => b.length - a.length)[0];
 }
 
+async function optimizeRunningCamera(scanner) {
+  if (!scanner) return;
+  const attempts = [
+    { focusMode: "continuous" },
+    { advanced: [{ focusMode: "continuous" }] },
+    {
+      focusMode: "continuous",
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+    },
+    {
+      advanced: [
+        { focusMode: "continuous" },
+        { width: 1920 },
+        { height: 1080 },
+      ],
+    },
+  ];
+  for (const constraints of attempts) {
+    try {
+      // Some browsers support only a subset of these constraints.
+      // html5-qrcode ignores unsupported keys without breaking scanning.
+      // eslint-disable-next-line no-await-in-loop
+      await scanner.applyVideoConstraints(constraints);
+    } catch {
+      // ignore and try next profile
+    }
+  }
+}
+
 async function pickCameraIdOrConstraints() {
   try {
     const devices = await Html5Qrcode.getCameras();
@@ -81,9 +111,8 @@ export default function BarcodeScanner({ onDetected, onClose }) {
   const [starting, setStarting] = useState(true);
   const [cameraLive, setCameraLive] = useState(false);
   const detectionStateRef = useRef({
-    lastNormalized: "",
-    sameCount: 0,
-    lastSeenAt: 0,
+    lastAcceptedValue: "",
+    lastAcceptedAt: 0,
     locked: false,
   });
 
@@ -123,7 +152,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         const scanner = new Html5Qrcode(id, {
           verbose: false,
           formatsToSupport: MEDICATION_FORMATS,
-          useBarCodeDetectorIfSupported: false,
+          useBarCodeDetectorIfSupported: true,
         });
         scannerRef.current = scanner;
 
@@ -133,15 +162,14 @@ export default function BarcodeScanner({ onDetected, onClose }) {
           scanner.start(
             cam,
             {
-              fps: 14,
+              fps: 24,
               /**
-               * Zone plus large que haute: meilleure détection des codes-barres 1D.
-               * Les QR restent lisibles car la zone reste centrée et suffisamment grande.
+               * Large scan area to avoid forcing user
+               * to center the barcode exactly in a small box.
                */
               qrbox: (vw, vh) => {
-                const minEdge = Math.min(vw, vh);
-                const width = Math.max(220, Math.min(Math.floor(vw * 0.9), vw - 16));
-                const height = Math.max(120, Math.min(Math.floor(minEdge * 0.42), vh - 16));
+                const width = Math.max(260, Math.min(Math.floor(vw * 0.96), vw - 8));
+                const height = Math.max(150, Math.min(Math.floor(vh * 0.72), vh - 8));
                 return { width, height };
               },
               disableFlip: false,
@@ -156,20 +184,16 @@ export default function BarcodeScanner({ onDetected, onClose }) {
               // Keep only plausible barcode payloads (or QR containing barcode digits).
               if (!/^\d{8,14}$/.test(normalized)) return;
 
-              const windowMs = 1600;
+              // Anti-spam only: accept immediately, but avoid duplicate trigger burst.
+              const duplicateWindowMs = 1200;
               if (
-                state.lastNormalized === normalized &&
-                now - state.lastSeenAt <= windowMs
+                state.lastAcceptedValue === normalized &&
+                now - state.lastAcceptedAt <= duplicateWindowMs
               ) {
-                state.sameCount += 1;
-              } else {
-                state.lastNormalized = normalized;
-                state.sameCount = 1;
+                return;
               }
-              state.lastSeenAt = now;
-
-              // Require the same value twice before accepting.
-              if (state.sameCount < 2) return;
+              state.lastAcceptedValue = normalized;
+              state.lastAcceptedAt = now;
               state.locked = true;
               const s = scannerRef.current;
               try {
@@ -202,6 +226,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
         }
 
         if (!cancelled) {
+          await optimizeRunningCamera(scanner);
           forceVideoVisible(id);
           setCameraLive(true);
         }
@@ -240,7 +265,7 @@ export default function BarcodeScanner({ onDetected, onClose }) {
                 className="inline-block h-2 w-2 rounded-full bg-emerald-400 animate-pulse"
                 aria-hidden
               />
-              Placez le QR entier dans le cadre vert (forme carrée)
+              Passez le code-barres devant la caméra (scan rapide)
             </p>
           )}
         </div>
@@ -277,9 +302,8 @@ export default function BarcodeScanner({ onDetected, onClose }) {
           )}
         </div>
         <p className="text-xs text-white/65 text-center mt-3 max-w-lg px-2">
-          <strong className="text-white/85">QR code :</strong> alignez le carré
-          du QR dans le cadre vert (même forme). Pour un code-barres, centrez la
-          bande dans ce cadre. Évitez le flou et le contre-jour.
+          La mise au point est automatique si supportée. Pour un résultat optimal,
+          gardez une distance de 10-20 cm et évitez les reflets forts.
         </p>
       </div>
 
