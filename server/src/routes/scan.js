@@ -67,6 +67,15 @@ function createScanLogger(reqId) {
   };
 }
 
+function createBarcodeLogger(reqId) {
+  return (event, details = {}) => {
+    if (!isScanDebugEnabled()) return;
+    const safe = { ...details };
+    if (typeof safe.apiKey === "string") delete safe.apiKey;
+    console.log(`[scan:barcode][${reqId}] ${event}`, safe);
+  };
+}
+
 function splitDataUrl(input) {
   const raw = String(input ?? "").trim();
   const m = raw.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
@@ -1601,12 +1610,21 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: parsed.error.flatten() });
   }
 
+  const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  const log = createBarcodeLogger(reqId);
   const codeInput = parsed.data.code_barre;
   const codeCandidates = extractBarcodeCandidates(codeInput);
   const code = codeCandidates[0] || codeInput.replace(/\s+/g, "");
+  log("request_received", {
+    codeInput,
+    normalizedCode: code,
+    candidates: codeCandidates.slice(0, 8),
+  });
 
   let local = null;
+  let matchedLocalCode = "";
   for (const candidate of codeCandidates.length > 0 ? codeCandidates : [code]) {
+    log("lookup_local_try", { candidate });
     // eslint-disable-next-line no-await-in-loop
     local = await prisma.medicament.findFirst({
       where: {
@@ -1619,13 +1637,32 @@ router.post("/", async (req, res) => {
         },
       },
     });
-    if (local) break;
+    if (local) {
+      matchedLocalCode = candidate;
+      log("lookup_local_hit", {
+        candidate,
+        medicamentId: local.id,
+        nom: local.nom,
+      });
+      break;
+    }
   }
   let catalogHit = null;
+  let matchedCatalogCode = "";
   for (const candidate of codeCandidates.length > 0 ? codeCandidates : [code]) {
+    log("lookup_catalog_try", { candidate });
     // eslint-disable-next-line no-await-in-loop
     catalogHit = await lookupTaawidatyByCode(candidate);
-    if (catalogHit) break;
+    if (catalogHit) {
+      matchedCatalogCode = candidate;
+      log("lookup_catalog_hit", {
+        candidate,
+        nom: catalogHit.nom,
+        dosage: catalogHit.dosage,
+        principeActif: catalogHit.principeActif,
+      });
+      break;
+    }
   }
 
   if (local) {
@@ -1683,6 +1720,19 @@ router.post("/", async (req, res) => {
     });
   }
 
+  const catalogSize =
+    taawidatyCache.rows.length > 0
+      ? taawidatyCache.rows.length
+      : (await loadTaawidatyCatalog()).length;
+  log("lookup_not_found", {
+    codeInput,
+    normalizedCode: code,
+    candidatesTried: codeCandidates.length > 0 ? codeCandidates : [code],
+    matchedLocalCode,
+    matchedCatalogCode,
+    catalogSize,
+  });
+
   return res.json({
     status: "not_found",
     code_barre: code,
@@ -1690,6 +1740,13 @@ router.post("/", async (req, res) => {
     medicament: null,
     message:
       "Aucun résultat trouvé dans la base locale et les fichiers catalogue.",
+    debug: isScanDebugEnabled()
+      ? {
+          reqId,
+          candidatesTried: codeCandidates.length > 0 ? codeCandidates : [code],
+          catalogSize,
+        }
+      : undefined,
   });
 });
 

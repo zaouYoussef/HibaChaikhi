@@ -745,6 +745,9 @@ function scoreCatalogMatch(query, row) {
 }
 
 function buildSuggestionKey(item) {
+  const code = cleanText(item?.code || item?.codeBarre);
+  const normalizedCode = normalizeCode(code);
+  if (normalizedCode) return `code:${normalizedCode}`;
   return `${normalizeText(item.nom)}|${normalizeText(item.dosage)}|${normalizeText(item.principeActif)}`;
 }
 
@@ -809,9 +812,9 @@ async function fetchLocalAndReferenceSuggestions(query) {
       if (nq.length >= 4 && Math.max(nameTokenMax, paTokenMax) >= 0.55) score += 20;
       return { item, score };
     })
-    .filter((entry) => entry.score >= 40)
+    .filter((entry) => entry.score >= 25)
     .sort((a, b) => b.score - a.score)
-    .slice(0, 50)
+    .slice(0, 120)
     .map((entry) => entry.item);
 
   return { localSuggestions, referenceSuggestions };
@@ -837,7 +840,7 @@ export async function suggestMedicaments(req, res) {
     if (!key || seen.has(key)) continue;
     seen.add(key);
     items.push(row);
-    if (items.length >= 10) break;
+    if (items.length >= 30) break;
   }
 
   return res.json({ query: q, items });

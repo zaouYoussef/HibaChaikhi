@@ -133,7 +133,7 @@ export default function AddMedicamentPage() {
         const data = await apiFetch(`/suggest?q=${encodeURIComponent(q)}`);
         if (!cancelled) {
           const list = Array.isArray(data?.items) ? data.items : [];
-          setRemoteSuggestions(list.slice(0, 8));
+          setRemoteSuggestions(list.slice(0, 30));
         }
       } catch {
         if (!cancelled) setRemoteSuggestions([]);
@@ -152,7 +152,11 @@ export default function AddMedicamentPage() {
     const seen = new Set();
     const out = [];
     for (const item of merged) {
-      const key = `${String(item?.nom ?? "").trim().toLowerCase()}|${String(
+      const key = `${String(item?.code ?? item?.codeBarre ?? "").trim()}|${String(
+        item?.nom ?? ""
+      )
+        .trim()
+        .toLowerCase()}|${String(
         item?.principeActif ?? ""
       )
         .trim()
@@ -162,7 +166,7 @@ export default function AddMedicamentPage() {
       if (!key || seen.has(key)) continue;
       seen.add(key);
       out.push(item);
-      if (out.length >= 10) break;
+      if (out.length >= 30) break;
     }
     return out;
   }, [localSuggestions, remoteSuggestions]);
