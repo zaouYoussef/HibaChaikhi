@@ -128,168 +128,6 @@ function buildQueryCandidates(query) {
   return uniqCompact([original, normalized]);
 }
 
-function toArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string" && value.trim()) return [value.trim()];
-  return [];
-}
-
-async function fetchRxNormTermCandidates(query, signal) {
-  const terms = [];
-  try {
-    const spellingUrl = `https://rxnav.nlm.nih.gov/REST/spellingsuggestions.json?name=${encodeURIComponent(
-      query
-    )}`;
-    const spellingRes = await fetch(spellingUrl, { signal });
-    if (spellingRes.ok) {
-      const spellingBody = await spellingRes.json();
-      const suggestions = toArray(
-        spellingBody?.suggestionGroup?.suggestionList?.suggestion
-      );
-      terms.push(...suggestions);
-    }
-  } catch {
-    // Ignore this API branch and continue with remaining sources.
-  }
-
-  try {
-    const approxUrl = `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodeURIComponent(
-      query
-    )}&maxEntries=8`;
-    const approxRes = await fetch(approxUrl, { signal });
-    if (approxRes.ok) {
-      const approxBody = await approxRes.json();
-      const candidates = approxBody?.approximateGroup?.candidate ?? [];
-      for (const candidate of candidates) {
-        const term = String(candidate?.rxstring ?? "").trim();
-        if (term) terms.push(term);
-        const rxcui = String(candidate?.rxcui ?? "").trim();
-        if (!rxcui) continue;
-        try {
-          const propsUrl = `https://rxnav.nlm.nih.gov/REST/rxcui/${encodeURIComponent(
-            rxcui
-          )}/properties.json`;
-          const propsRes = await fetch(propsUrl, { signal });
-          if (!propsRes.ok) continue;
-          const propsBody = await propsRes.json();
-          const name = String(propsBody?.properties?.name ?? "").trim();
-          if (name) terms.push(name);
-        } catch {
-          // Ignore single-candidate lookup errors.
-        }
-      }
-    }
-  } catch {
-    // Ignore this API branch and continue with remaining sources.
-  }
-
-  return uniqCompact(terms);
-}
-
-function isValidEquivalentName(value) {
-  const name = String(value ?? "").trim();
-  if (!name) return false;
-  if (name.includes("{") || name.includes("}")) return false;
-  if (/\bpack\b/i.test(name)) return false;
-  if (name.split("/").length > 2) return false;
-  return true;
-}
-
-async function fetchRxNormSuggestions(query) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
-  try {
-    const queryCandidates = uniqCompact([
-      ...buildQueryCandidates(query),
-      ...(await fetchRxNormTermCandidates(query, controller.signal)),
-    ]).slice(0, 10);
-
-    const names = [];
-    for (const candidate of queryCandidates) {
-      const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(candidate)}`;
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) continue;
-      const body = await res.json();
-      const groups = body?.drugGroup?.conceptGroup ?? [];
-      const concepts = groups.flatMap((g) => g?.conceptProperties ?? []);
-      for (const drug of concepts) {
-        const name = String(drug?.name ?? "").trim();
-        if (name) names.push(name);
-      }
-    }
-
-    return names
-      .map((drug) => {
-        const rawName = String(drug ?? "").trim();
-        if (!rawName) return null;
-        if (rawName.startsWith("{")) return null;
-        if (/\bpack\b/i.test(rawName)) return null;
-        const dosageMatch = rawName.match(
-          /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|iu)\b/i
-        );
-        const dosage = dosageMatch ? dosageMatch[0] : "";
-        const principeActif = dosageMatch
-          ? rawName.slice(0, dosageMatch.index).trim()
-          : rawName.split(/\s+/).slice(0, 2).join(" ");
-        return {
-          nom: rawName,
-          dosage,
-          principeActif,
-          source: "rxnorm",
-        };
-      })
-      .filter(Boolean);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchOpenFdaSuggestions(query) {
-  const trimmed = String(query ?? "").trim();
-  if (!trimmed) return [];
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
-  try {
-    const escaped = trimmed.replace(/"/g, '\\"');
-    const searches = [
-      `openfda.brand_name:${escaped}*`,
-      `openfda.generic_name:${escaped}*`,
-    ];
-    const items = [];
-
-    for (const search of searches) {
-      const url = `https://api.fda.gov/drug/label.json?search=${encodeURIComponent(
-        search
-      )}&limit=8`;
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) continue;
-      const body = await res.json();
-      const results = Array.isArray(body?.results) ? body.results : [];
-      for (const row of results) {
-        const brand = String(row?.openfda?.brand_name?.[0] ?? "").trim();
-        const generic = String(row?.openfda?.generic_name?.[0] ?? "").trim();
-        const nom = brand || generic;
-        if (!nom) continue;
-        items.push({
-          nom,
-          dosage: "",
-          principeActif: generic || brand,
-          source: "openfda",
-        });
-      }
-    }
-
-    return items;
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function fetchLocalAndReferenceSuggestions(query) {
   const candidates = uniqCompact([query, ...buildQueryCandidates(query)]).slice(0, 8);
   const localRows = await prisma.medicament.findMany({
@@ -309,24 +147,7 @@ async function fetchLocalAndReferenceSuggestions(query) {
     source: "local",
   }));
 
-  const eqRows = await prisma.equivalent.findMany({
-    where: {
-      OR: candidates.flatMap((candidate) => [
-        { nomMedicament: containsInsensitive(candidate) },
-        { principeActif: containsInsensitive(candidate) },
-      ]),
-    },
-    orderBy: { nomMedicament: "asc" },
-    take: 20,
-  });
-  const referenceSuggestions = eqRows.map((e) => ({
-    nom: e.nomMedicament,
-    dosage: "",
-    principeActif: e.principeActif,
-    source: "reference",
-  }));
-
-  return { localSuggestions, referenceSuggestions };
+  return { localSuggestions, referenceSuggestions: [] };
 }
 
 export async function suggestMedicaments(req, res) {
@@ -337,14 +158,9 @@ export async function suggestMedicaments(req, res) {
 
   const { localSuggestions, referenceSuggestions } =
     await fetchLocalAndReferenceSuggestions(q);
-
-  const externalSuggestions = await fetchRxNormSuggestions(q);
-  const openFdaSuggestions = await fetchOpenFdaSuggestions(q);
   const merged = [
     ...localSuggestions,
     ...referenceSuggestions,
-    ...externalSuggestions,
-    ...openFdaSuggestions,
   ];
   const seen = new Set();
   const items = [];
@@ -365,9 +181,7 @@ export async function autocompleteMedicaments(req, res) {
   if (q.length < 2) return res.json([]);
   const { items } = await (async () => {
     const { localSuggestions } = await fetchLocalAndReferenceSuggestions(q);
-    const externalSuggestions = await fetchRxNormSuggestions(q);
-    const openFdaSuggestions = await fetchOpenFdaSuggestions(q);
-    const merged = [...localSuggestions, ...externalSuggestions, ...openFdaSuggestions];
+    const merged = [...localSuggestions];
     const seen = new Set();
     const deduped = [];
     for (const row of merged) {
@@ -427,20 +241,6 @@ export async function searchMedicaments(req, res) {
     directMatches.map((m) => m.principeActif.trim()).filter(Boolean)
   );
 
-  const equivByName = await prisma.equivalent.findMany({
-    where: {
-      OR: [
-        { nomMedicament: exactPattern },
-        { nomMedicament: pattern },
-        { principeActif: exactPattern },
-        { principeActif: pattern },
-      ],
-    },
-  });
-  for (const e of equivByName.filter((row) => isValidEquivalentName(row.nomMedicament))) {
-    principles.add(e.principeActif.trim());
-  }
-
   // Fallback approximation: used only to infer active principle,
   // never to mark query as directly "disponible".
   if (principles.size === 0) {
@@ -470,50 +270,9 @@ export async function searchMedicaments(req, res) {
     });
   }
 
-  let equivRefs = [];
-  if (paList.length > 0) {
-    equivRefs = await prisma.equivalent.findMany({
-      where: {
-        OR: paList.map((pa) => ({
-          principeActif: { equals: pa, mode: "insensitive" },
-        })),
-      },
-    });
-  }
-  equivRefs = equivRefs.filter((row) => isValidEquivalentName(row.nomMedicament));
-
-  const seen = new Set();
-  const equivalents = [];
-
-  for (const m of altMeds) {
-    const firstLot = (m.lots ?? [])
-      .filter((lot) => lot.quantite > 0)
-      .sort(
-        (a, b) =>
-          new Date(a.dateExpiration).getTime() - new Date(b.dateExpiration).getTime()
-      )[0];
-    if (!firstLot) continue;
-    const key = `med-${m.id}-${firstLot.id}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      equivalents.push({
-        kind: "stock",
-        ...mapMed(m, firstLot),
-      });
-    }
-  }
-  for (const e of equivRefs) {
-    const key = `eq-${e.id}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      equivalents.push({
-        kind: "reference",
-        id: e.id,
-        nom: e.nomMedicament,
-        principeActif: e.principeActif,
-      });
-    }
-  }
+  const equivalents = altMeds
+    .map((m) => summarizeMedicament(m))
+    .filter((m) => m.id !== directMatches?.[0]?.id);
 
   const equivalentAvailableLots = altMeds
     .flatMap((m) =>

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { apiFetch } from "../api.js";
 import BarcodeScanner from "../components/BarcodeScanner.jsx";
-import VisualMedScanner from "../components/VisualMedScanner.jsx";
 
 const empty = {
   nom: "",
@@ -26,15 +25,6 @@ function uniqueTemplates(meds) {
 function isBarcodeLike(value) {
   const cleaned = String(value ?? "").replace(/\s+/g, "");
   return /^\d{6,}$/.test(cleaned);
-}
-
-function isLikelyMedicationName(value) {
-  const v = String(value ?? "").trim();
-  if (!v) return false;
-  if (v.split(/\s+/).length > 7) return false;
-  if (v.length < 3 || v.length > 64) return false;
-  if (/^\d{5,}$/.test(v.replace(/\s+/g, ""))) return false;
-  return /[a-zA-Z]/.test(v);
 }
 
 function extractDosageFromText(value) {
@@ -74,14 +64,12 @@ export default function AddMedicamentPage() {
   const navigate = useNavigate();
   const [form, setForm] = useState(empty);
   const [scanOpen, setScanOpen] = useState(false);
-  const [visionOpen, setVisionOpen] = useState(false);
   const [msg, setMsg] = useState({ type: "", text: "" });
   const [loading, setLoading] = useState(false);
   const [catalog, setCatalog] = useState([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [remoteSuggestions, setRemoteSuggestions] = useState([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
-  const [visionEquivalents, setVisionEquivalents] = useState([]);
   const nomInputRef = useRef(null);
   const suggestRef = useRef(null);
 
@@ -208,8 +196,8 @@ export default function AddMedicamentPage() {
           payload?.status === "local"
             ? "Médicament reconnu en base locale : formulaire pré-rempli."
             : payload?.status === "external"
-              ? "Données récupérées via medicament.ma : vérifiez les champs avant enregistrement."
-              : "Code scanné, mais fiche introuvable sur medicament.ma. Saisissez le nom, le principe actif et le dosage manuellement.",
+              ? "Médicament trouvé dans les catalogues locaux (JSON/XLSX/PDF) : vérifiez les champs avant enregistrement."
+              : "Code scanné, mais fiche introuvable dans les données locales. Saisissez le nom, le principe actif et le dosage manuellement.",
       });
     } catch {
       setMsg({
@@ -218,59 +206,6 @@ export default function AddMedicamentPage() {
       });
     }
     setTimeout(() => nomInputRef.current?.focus(), 100);
-  }, []);
-
-  const onVisionFrameAnalyze = useCallback(async (imageBase64) => {
-    try {
-      const payload = await apiFetch("/scan/image", {
-        method: "POST",
-        body: JSON.stringify({ imageBase64 }),
-      });
-
-      const med = payload?.medicament;
-      const confidence = Number(payload?.confidence ?? 0);
-      const hasReliableName = isLikelyMedicationName(med?.nom);
-      const hasDosage = String(med?.dosage ?? "").trim().length >= 2;
-      const hasPrinciple = String(med?.principeActif ?? "").trim().length >= 3;
-      const isUsable = hasReliableName && confidence >= 0.5 && (hasDosage || hasPrinciple);
-
-      if (med && isUsable) {
-        setForm((f) => ({
-          ...f,
-          nom: med.nom || f.nom,
-          principeActif: med.principeActif || f.principeActif,
-          dosage: med.dosage || f.dosage,
-        }));
-        setVisionEquivalents(
-          Array.isArray(payload?.equivalents) ? payload.equivalents : []
-        );
-        setMsg({
-          type: "ok",
-          text:
-            payload?.status === "ok"
-              ? `Médicament détecté automatiquement par la caméra.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`
-              : `Lecture partielle: vérifiez les champs détectés avant enregistrement.${payload?.equivalentStored ? " Équivalence enregistrée." : ""}${payload?.equivalentsStoredFromWeb ? ` ${payload.equivalentsStoredFromWeb} équivalences web ajoutées.` : ""}`,
-        });
-        setVisionOpen(false);
-        return true;
-      }
-
-      setMsg({
-        type: "ok",
-        text:
-          payload?.message ||
-          "Lecture incertaine... rapprochez la caméra et cadrez clairement nom + dosage.",
-      });
-      return false;
-    } catch (err) {
-      setMsg({
-        type: "err",
-        text:
-          err?.message ||
-          "Analyse OCR impossible. Vérifiez la netteté/lumière puis réessayez.",
-      });
-      return false;
-    }
   }, []);
 
   function applySuggestion(m) {
@@ -375,19 +310,6 @@ export default function AddMedicamentPage() {
               Toujours possible
             </span>
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setVisionOpen(true);
-              setMsg({ type: "", text: "" });
-            }}
-            className="rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50 py-4 text-sm font-semibold text-emerald-800 hover:bg-emerald-100 sm:col-span-2"
-          >
-            🤖 Lecture caméra automatique
-            <span className="mt-1 block text-xs font-normal text-emerald-700/90">
-              Pointez la boîte: nom + dosage détectés automatiquement
-            </span>
-          </button>
         </div>
 
         <div className="relative">
@@ -414,7 +336,7 @@ export default function AddMedicamentPage() {
               role="listbox"
             >
               <li className="px-3 py-1.5 text-[10px] font-medium uppercase tracking-wide text-slate-400">
-                Suggestions stock + API
+                Suggestions base locale
               </li>
               {suggestLoading && (
                 <li className="px-3 py-2 text-xs text-slate-500">
@@ -437,7 +359,7 @@ export default function AddMedicamentPage() {
                     <span className="block text-xs text-slate-500">
                       {m.principeActif || "Principe actif non précisé"}
                       {m.dosage ? ` · ${m.dosage}` : ""}
-                      {m.source === "local" ? " · Local" : " · Suggestion API"}
+                      {" · Base locale"}
                     </span>
                   </button>
                 </li>
@@ -525,23 +447,6 @@ export default function AddMedicamentPage() {
           </p>
         )}
 
-        {visionEquivalents.length > 0 && (
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-3">
-            <p className="text-xs font-semibold text-emerald-900">
-              Équivalents suggérés
-            </p>
-            <ul className="mt-2 space-y-1">
-              {visionEquivalents.map((eq, idx) => (
-                <li key={`${eq.nom}-${idx}`} className="text-xs text-emerald-900">
-                  {eq.nom}
-                  {eq.dosage ? ` · ${eq.dosage}` : ""}
-                  {eq.principeActif ? ` · ${eq.principeActif}` : ""}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
         <button
           type="submit"
           disabled={loading}
@@ -553,20 +458,6 @@ export default function AddMedicamentPage() {
 
       {scanOpen && (
         <BarcodeScanner onDetected={onScan} onClose={() => setScanOpen(false)} />
-      )}
-      {visionOpen && (
-        <VisualMedScanner
-          onFrameAnalyze={onVisionFrameAnalyze}
-          onStalled={() => {
-            setVisionOpen(false);
-            setMsg({
-              type: "err",
-              text:
-                "Détection auto interrompue après plusieurs essais. Passez en saisie manuelle ou reprenez une photo plus nette.",
-            });
-          }}
-          onClose={() => setVisionOpen(false)}
-        />
       )}
     </div>
   );

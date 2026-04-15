@@ -3,9 +3,10 @@ import { z } from "zod";
 import { load } from "cheerio";
 import { createWorker } from "tesseract.js";
 import * as XLSX from "xlsx";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import pdfParse from "pdf-parse";
 import { prisma } from "../lib/prisma.js";
 
 const router = Router();
@@ -117,27 +118,48 @@ function splitNameAndDosage(rawLine) {
 }
 
 function getTaawidatySourceUrls() {
+  const defaults = [
+    path.resolve(projectRootDir, "medications-cnops.json"),
+    path.resolve(projectRootDir, "medications-cnss.json"),
+    path.resolve(projectRootDir, "allmeds.json"),
+  ];
   const configured = String(process.env.CATALOG_JSON_PATHS ?? "")
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
-  if (configured.length > 0) return configured;
-  return [
-    path.resolve(projectRootDir, "medications-cnops.json"),
-    path.resolve(projectRootDir, "medications-cnss.json"),
-  ];
+  // Always merge defaults + configured paths to maximize local coverage.
+  return [...new Set([...defaults, ...configured])];
 }
 
 function getOdooSourceUrls() {
+  const defaults = [
+    path.resolve(projectRootDir, "medicaments.xlsx"),
+    path.resolve(projectRootDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
+  ];
   const configured = String(process.env.CATALOG_XLSX_PATHS ?? "")
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
-  if (configured.length > 0) return configured;
-  return [
-    path.resolve(projectRootDir, "medicaments.xlsx"),
-    path.resolve(projectRootDir, "ref-des-medicaments-cnops-2014 (1) (1).xlsx"),
-  ];
+  // Always merge defaults + configured paths to maximize local coverage.
+  return [...new Set([...defaults, ...configured])];
+}
+
+async function getPdfSourceUrls() {
+  const configured = String(process.env.CATALOG_PDF_PATHS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (configured.length > 0) {
+    return [...new Set(configured)];
+  }
+  try {
+    const names = await readdir(projectRootDir);
+    return names
+      .filter((name) => name.toLowerCase().endsWith(".pdf"))
+      .map((name) => path.resolve(projectRootDir, name));
+  } catch {
+    return [];
+  }
 }
 
 async function readJsonFileSafe(filePath) {
@@ -156,6 +178,142 @@ async function readArrayBufferFileSafe(filePath) {
   } catch {
     return null;
   }
+}
+
+async function readTextFileSafe(filePath) {
+  try {
+    return await readFile(filePath, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+async function readPdfTextSafe(filePath) {
+  try {
+    const buf = await readFile(filePath);
+    const parsed = await pdfParse(buf);
+    return String(parsed?.text ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function getRmmgSourceUrls() {
+  const configured = String(process.env.CATALOG_RMMG_PATHS ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (configured.length > 0) return configured;
+  return [
+    path.resolve(projectRootDir, "rmmg-ammps-2026.txt"),
+    path.resolve(projectRootDir, "rmmg-ammps-2026.pdf.txt"),
+  ];
+}
+
+function parseRmmgText(rawText) {
+  const lines = String(rawText ?? "")
+    .split(/\r?\n/g)
+    .map((line) => cleanText(line))
+    .filter(Boolean);
+  if (lines.length === 0) return [];
+
+  const entries = [];
+  const codeRegex = /(\d{8,14})\s*$/;
+  let currentGroup = "";
+  let currentGroupPrinciple = "";
+  let currentGroupDosage = "";
+  let currentRowBuffer = "";
+
+  const flushRowIfComplete = (rowText) => {
+    const compactRow = cleanText(rowText);
+    if (!compactRow) return;
+    const codeMatch = compactRow.match(codeRegex);
+    if (!codeMatch) return;
+
+    const code = normalizeCode(codeMatch[1]);
+    let core = cleanText(compactRow.replace(codeRegex, ""));
+    core = core.replace(/^(BS|P|G|I)\s+/i, "");
+    if (!core || !code) return;
+
+    const parsedName = splitNameAndDosage(core);
+    const nom = cleanText(parsedName.nom || core);
+    const dosage = cleanText(parsedName.dosage || currentGroupDosage);
+    const principeActif = cleanText(currentGroupPrinciple);
+    if (!nom) return;
+
+    entries.push({
+      code,
+      fullName: cleanText(core),
+      nom,
+      dosage,
+      principeActif,
+    });
+  };
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    if (
+      lower.startsWith("répertoire marocain des médicaments génériques") ||
+      lower.startsWith("https://ammps.sante.gov.ma/") ||
+      lower.startsWith("page ")
+    ) {
+      continue;
+    }
+
+    const groupMatch = line.match(/^groupe générique\s*:\s*(.+)$/i);
+    if (groupMatch) {
+      currentGroup = cleanText(groupMatch[1]);
+      const parsedGroup = splitNameAndDosage(currentGroup);
+      currentGroupPrinciple = cleanText(parsedGroup.nom || currentGroup);
+      currentGroupDosage = cleanText(parsedGroup.dosage);
+      currentRowBuffer = "";
+      continue;
+    }
+
+    if (
+      /^voie d['’]administration\s*:/i.test(line) ||
+      /^spécialité pharmaceutique/i.test(line) ||
+      /^_{3,}$/.test(line)
+    ) {
+      continue;
+    }
+
+    const startsLikeRow = /^(BS|P|G|I)\s+/i.test(line);
+    const hasBarcode = codeRegex.test(line);
+
+    if (startsLikeRow && currentRowBuffer && !hasBarcode) {
+      currentRowBuffer = line;
+      continue;
+    }
+    if (startsLikeRow && !currentRowBuffer) {
+      currentRowBuffer = line;
+      if (hasBarcode) {
+        flushRowIfComplete(currentRowBuffer);
+        currentRowBuffer = "";
+      }
+      continue;
+    }
+
+    if (currentRowBuffer) {
+      currentRowBuffer = `${currentRowBuffer} ${line}`.trim();
+      if (codeRegex.test(currentRowBuffer)) {
+        flushRowIfComplete(currentRowBuffer);
+        currentRowBuffer = "";
+      }
+      continue;
+    }
+
+    // Some rows may start directly without marker in malformed exports.
+    if (hasBarcode && currentGroup) {
+      flushRowIfComplete(line);
+    }
+  }
+
+  if (currentRowBuffer) {
+    flushRowIfComplete(currentRowBuffer);
+  }
+
+  return entries;
 }
 
 function readFieldFromRow(row, aliases) {
@@ -269,7 +427,16 @@ async function loadTaawidatyCatalog() {
       };
     })
     .filter(Boolean);
-  const rows = [...taawidatyRows, ...odooRows];
+
+  const rmmgUrls = getRmmgSourceUrls();
+  const rmmgTexts = await Promise.all(rmmgUrls.map((filePath) => readTextFileSafe(filePath)));
+  const rmmgRows = rmmgTexts.flatMap((text) => parseRmmgText(text));
+
+  const pdfUrls = await getPdfSourceUrls();
+  const pdfTexts = await Promise.all(pdfUrls.map((filePath) => readPdfTextSafe(filePath)));
+  const pdfRows = pdfTexts.flatMap((text) => parseRmmgText(text));
+
+  const rows = [...taawidatyRows, ...odooRows, ...rmmgRows, ...pdfRows];
 
   const dedup = new Map();
   for (const row of rows) {
@@ -1006,26 +1173,15 @@ async function inferMedicationFromOcrText(ocrText) {
     select: { id: true, nom: true, principeActif: true, dosage: true },
     take: 5,
   });
-  const equivalentsRef = await prisma.equivalent.findMany({
-    where: { principeActif: { equals: best.principeActif } },
-    select: { nomMedicament: true, principeActif: true },
-    take: 5,
-  });
 
-  const equivalents = [
-    ...equivalentsLocal.map((m) => ({
+  const equivalents = equivalentsLocal
+    .map((m) => ({
       nom: m.nom,
       principeActif: m.principeActif,
       dosage: m.dosage,
       source: "local",
-    })),
-    ...equivalentsRef.map((m) => ({
-      nom: m.nomMedicament,
-      principeActif: m.principeActif,
-      dosage: "",
-      source: "reference",
-    })),
-  ].slice(0, 8);
+    }))
+    .slice(0, 8);
 
   return {
     status: "ok",
@@ -1224,7 +1380,7 @@ router.post("/", async (req, res) => {
           cleanText(taawidatyHit.principeActif) || "Principe actif non renseigné",
         source: "local_catalog",
       },
-      message: "Résultat récupéré via catalogue local (Excel/JSON)",
+      message: "Résultat récupéré via catalogue local (Excel/JSON/RMMG)",
     });
   }
 
@@ -1239,139 +1395,15 @@ router.post("/", async (req, res) => {
 });
 
 router.post("/image", async (req, res) => {
-  const reqId = Math.random().toString(36).slice(2, 10);
-  const log = createScanLogger(reqId);
-  const startedAt = Date.now();
   const parsed = imageScanSchema.safeParse(req.body);
   if (!parsed.success) {
-    log("request_invalid_payload");
     return res.status(400).json({ error: parsed.error.flatten() });
   }
-  try {
-    log("request_start", {
-      hasBase64: Boolean(parsed.data?.imageBase64),
-      payloadLength: String(parsed.data?.imageBase64 ?? "").length,
-    });
-    let ocrText = "";
-    // Mode 100% gratuit: OCR local prioritaire (sans dépendre de Gemini).
-    ocrText = await readTextFromBase64Image(parsed.data.imageBase64, log);
-    if (!ocrText) {
-      log("failure_no_text_detected", { elapsedMs: Date.now() - startedAt });
-      return res.json({
-        status: "not_found",
-        confidence: 0,
-        medicament: null,
-        equivalents: [],
-        message:
-          "Aucun texte lisible détecté. Essayez une image plus nette (lumière + focus).",
-      });
-    }
-    let inferred = await inferMedicationFromOcrText(ocrText);
-    const hasReliableOcr =
-      Boolean(inferred?.medicament?.nom) && Number(inferred?.confidence ?? 0) >= 0.7;
-    if (!hasReliableOcr) {
-      const vision = await extractMedicationWithVisionApi(parsed.data.imageBase64, log);
-      if (vision?.medicament?.nom) {
-        inferred = {
-          ...vision,
-          medicament: {
-            ...vision.medicament,
-            principeActif:
-              cleanText(vision?.medicament?.principeActif) ||
-              cleanText(inferred?.medicament?.principeActif),
-            dosage:
-              cleanText(vision?.medicament?.dosage) ||
-              cleanText(inferred?.medicament?.dosage),
-          },
-        };
-      }
-    }
-    if (inferred?.medicament?.nom) {
-      inferred = {
-        ...inferred,
-        medicament: await enrichPrincipleFromWeb(inferred.medicament),
-      };
-    }
-    log("ocr_inference_done", {
-      status: inferred?.status,
-      confidence: inferred?.confidence,
-      hasMedicament: Boolean(inferred?.medicament),
-      bestName: inferred?.medicament?.nom,
-    });
-
-    if (!inferred?.medicament?.nom) {
-      log("failure_uncertain_detection", {
-        confidence: inferred?.confidence,
-        elapsedMs: Date.now() - startedAt,
-      });
-      return res.json({
-        status: "not_found",
-        confidence: Number(inferred?.confidence ?? 0),
-        medicament: null,
-        equivalents: [],
-        message:
-          "Détection trop incertaine. Reprenez la photo plus près (nom bien cadré).",
-        ocrTextPreview: ocrText.slice(0, 240),
-      });
-    }
-
-    let equivalentStored = false;
-    let equivalentsStoredFromWeb = 0;
-    let mergedEquivalents = Array.isArray(inferred?.equivalents)
-      ? [...inferred.equivalents]
-      : [];
-    if (inferred?.medicament?.nom && inferred?.medicament?.principeActif) {
-      equivalentStored = await storeEquivalentReference(
-        inferred.medicament.principeActif,
-        inferred.medicament.nom
-      );
-      log("equivalent_primary_store", { equivalentStored });
-    }
-    if (inferred?.medicament?.nom) {
-      const webEquivalents = await fetchRxNormWebEquivalents({
-        nom: inferred.medicament.nom,
-        principeActif: inferred.medicament.principeActif,
-      });
-      mergedEquivalents = dedupeEquivalentItems([
-        ...mergedEquivalents,
-        ...webEquivalents,
-      ]).slice(0, 10);
-
-      if (inferred?.medicament?.principeActif && webEquivalents.length > 0) {
-        equivalentsStoredFromWeb = await storeEquivalentReferencesBulk(
-          inferred.medicament.principeActif,
-          webEquivalents.map((e) => e.nom)
-        );
-      }
-      log("equivalents_web_merge", {
-        webCount: webEquivalents.length,
-        storedFromWeb: equivalentsStoredFromWeb,
-      });
-    }
-    log("request_success", {
-      elapsedMs: Date.now() - startedAt,
-      confidence: inferred?.confidence,
-      source: inferred?.medicament?.source,
-    });
-    return res.json({
-      ...inferred,
-      equivalents: mergedEquivalents,
-      equivalentStored,
-      equivalentsStoredFromWeb,
-      ocrTextPreview: inferred?.ocrTextPreview || ocrText.slice(0, 240),
-    });
-  } catch (err) {
-    log("request_exception", {
-      elapsedMs: Date.now() - startedAt,
-      name: err?.name,
-      message: err?.message,
-    });
-    return res.status(500).json({
-      error:
-        err?.message ||
-        "Lecture image impossible pour le moment. Réessayez avec plus de lumière.",
-    });
-  }
+  return res.status(410).json({
+    status: "disabled",
+    message:
+      "Le lecteur caméra est désactivé. Utilisez uniquement le scan code-barres/QR.",
+  });
 });
 
 export default router;
