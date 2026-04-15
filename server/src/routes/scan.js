@@ -6,7 +6,7 @@ import * as XLSX from "xlsx";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import pdfParse from "pdf-parse";
+import { PDFParse } from "pdf-parse";
 import { prisma } from "../lib/prisma.js";
 
 const router = Router();
@@ -191,8 +191,13 @@ async function readTextFileSafe(filePath) {
 async function readPdfTextSafe(filePath) {
   try {
     const buf = await readFile(filePath);
-    const parsed = await pdfParse(buf);
-    return String(parsed?.text ?? "");
+    const parser = new PDFParse({ data: buf });
+    try {
+      const parsed = await parser.getText();
+      return String(parsed?.text ?? "");
+    } finally {
+      await parser.destroy();
+    }
   } catch {
     return "";
   }
