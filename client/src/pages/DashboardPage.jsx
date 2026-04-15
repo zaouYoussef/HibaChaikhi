@@ -56,6 +56,11 @@ export default function DashboardPage() {
     d.setHours(0, 0, 0, 0);
     return d;
   }, []);
+  const endOfMonth = useMemo(() => {
+    const d = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    d.setHours(23, 59, 59, 999);
+    return d;
+  }, [now]);
 
   const lotsFlat = useMemo(() => {
     if (!sortedMeds.length) return [];
@@ -94,6 +99,11 @@ export default function DashboardPage() {
       const delta = exp.getTime() - now.getTime();
       return delta >= 0 && delta <= 7 * 24 * 60 * 60 * 1000;
     }).length;
+    const thisMonth = lotsFlat.filter((l) => {
+      const exp = new Date(l.dateExpiration ?? "9999-12-31");
+      exp.setHours(0, 0, 0, 0);
+      return exp >= now && exp <= endOfMonth;
+    }).length;
     const criticalMeds = sortedMeds.filter(
       (m) => m.stockStatus === "critical"
     ).length;
@@ -103,17 +113,18 @@ export default function DashboardPage() {
       totalLots,
       expiredLots,
       in7Days,
+      thisMonth,
       criticalMeds,
       lowMeds,
     };
-  }, [sortedMeds, lotsFlat, now]);
+  }, [sortedMeds, lotsFlat, now, endOfMonth]);
 
   const urgentLots = useMemo(() => {
     return [...lotsFlat]
       .filter((l) => {
         const exp = new Date(l.dateExpiration ?? "9999-12-31");
         exp.setHours(0, 0, 0, 0);
-        return exp <= new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        return exp >= now && exp <= endOfMonth;
       })
       .sort(
         (a, b) =>
@@ -121,7 +132,7 @@ export default function DashboardPage() {
           new Date(b.dateExpiration ?? "9999-12-31").getTime()
       )
       .slice(0, 6);
-  }, [lotsFlat, now]);
+  }, [lotsFlat, now, endOfMonth]);
 
   const criticalStockRows = useMemo(() => {
     return sortedMeds
@@ -175,7 +186,7 @@ export default function DashboardPage() {
       color: "bg-indigo-500",
     },
     {
-      label: "Expire dans 30 jours",
+      label: "Expire ce mois-ci",
       value: stats.bientotExpires,
       hint: "Lots encore en stock",
       color: "bg-amber-500",
@@ -259,15 +270,15 @@ export default function DashboardPage() {
       <section className="mt-8 grid gap-4 lg:grid-cols-2">
         <article className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
           <h2 className="text-sm font-semibold text-amber-900">
-            Priorités péremption (0-7 jours)
+            Priorités péremption (ce mois)
           </h2>
           <p className="mt-1 text-xs text-amber-800">
             {dashboardMetrics.expiredLots} lots déjà expirés,{" "}
-            {dashboardMetrics.in7Days} lots expirent dans 7 jours.
+            {dashboardMetrics.thisMonth} lots expirent ce mois-ci.
           </p>
           {urgentLots.length === 0 ? (
             <p className="mt-3 text-xs text-amber-800/80">
-              Aucun lot urgent dans la semaine.
+              Aucun lot à échéance ce mois-ci.
             </p>
           ) : (
             <ul className="mt-3 space-y-2">

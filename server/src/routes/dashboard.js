@@ -5,14 +5,14 @@ const router = Router();
 
 router.get("/stats", async (_req, res) => {
   const now = new Date();
-  const in30 = new Date(now);
-  in30.setDate(in30.getDate() + 30);
+  const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+  endOfMonth.setHours(23, 59, 59, 999);
   const [total, lotsSoon, meds] = await Promise.all([
     prisma.medicament.count(),
     prisma.lot.count({
       where: {
         quantite: { gt: 0 },
-        dateExpiration: { lte: in30 },
+        dateExpiration: { lte: endOfMonth },
       },
     }),
     prisma.medicament.findMany({
@@ -34,7 +34,7 @@ router.get("/stats", async (_req, res) => {
     bientotExpires: lotsSoon,
     stockFaible,
     seuilStockFaible: 10,
-    fenetreExpirationJours: 30,
+    fenetreExpiration: "fin_du_mois",
   });
 });
 
