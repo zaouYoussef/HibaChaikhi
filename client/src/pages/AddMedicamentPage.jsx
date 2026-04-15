@@ -122,7 +122,6 @@ export default function AddMedicamentPage() {
   const [remoteSuggestions, setRemoteSuggestions] = useState([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
   const [proposedEquivalents, setProposedEquivalents] = useState([]);
-  const [addedEquivalents, setAddedEquivalents] = useState([]);
   const nomInputRef = useRef(null);
   const suggestRef = useRef(null);
 
@@ -187,33 +186,6 @@ export default function AddMedicamentPage() {
       clearTimeout(timer);
     };
   }, [form.nom]);
-
-  useEffect(() => {
-    const principle = String(form.principeActif ?? "").trim();
-    if (!principle) {
-      setAddedEquivalents([]);
-      return;
-    }
-    let cancelled = false;
-    const timer = setTimeout(async () => {
-      try {
-        const rows = await apiFetch("/equivalents");
-        if (cancelled) return;
-        const filtered = (Array.isArray(rows) ? rows : []).filter(
-          (row) =>
-            String(row?.principeActif ?? "").trim().toLowerCase() ===
-            principle.toLowerCase()
-        );
-        setAddedEquivalents(normalizeEquivalentItems(filtered));
-      } catch {
-        if (!cancelled) setAddedEquivalents([]);
-      }
-    }, 150);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-    };
-  }, [form.principeActif]);
 
   const suggestions = useMemo(() => {
     const merged = [...localSuggestions, ...remoteSuggestions];
@@ -349,13 +321,6 @@ export default function AddMedicamentPage() {
       }));
       const list = await apiFetch("/medicaments");
       if (Array.isArray(list)) setCatalog(list);
-      const rows = await apiFetch("/equivalents");
-      const filtered = (Array.isArray(rows) ? rows : []).filter(
-        (row) =>
-          String(row?.principeActif ?? "").trim().toLowerCase() ===
-          form.principeActif.trim().toLowerCase()
-      );
-      setAddedEquivalents(normalizeEquivalentItems(filtered));
     } catch (err) {
       setMsg({
         type: "err",
@@ -560,44 +525,22 @@ export default function AddMedicamentPage() {
           </p>
         )}
 
-        {(proposedEquivalents.length > 0 || addedEquivalents.length > 0) && (
-          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-3">
-            {proposedEquivalents.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-slate-700 mb-1">
-                  Équivalents proposés
-                </p>
-                <div className="flex flex-wrap gap-1.5">
-                  {proposedEquivalents.map((eq) => (
-                    <span
-                      key={`p-${eq.nom}-${eq.code}`}
-                      className="inline-flex rounded-full border border-clinic-200 bg-clinic-50 px-2 py-1 text-[11px] text-clinic-900"
-                    >
-                      {eq.nom}
-                      {eq.code ? ` [${eq.code}]` : ""}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-            {addedEquivalents.length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-slate-700 mb-1">
-                  Équivalents ajoutés
-                </p>
-                <div className="flex flex-wrap gap-1.5">
-                  {addedEquivalents.map((eq) => (
-                    <span
-                      key={`a-${eq.nom}-${eq.code}`}
-                      className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] text-emerald-900"
-                    >
-                      {eq.nom}
-                      {eq.code ? ` [${eq.code}]` : ""}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
+        {proposedEquivalents.length > 0 && (
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <p className="text-xs font-semibold text-slate-700 mb-1">
+              Équivalents proposés
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              {proposedEquivalents.map((eq) => (
+                <span
+                  key={`p-${eq.nom}-${eq.code}`}
+                  className="inline-flex rounded-full border border-clinic-200 bg-clinic-50 px-2 py-1 text-[11px] text-clinic-900"
+                >
+                  {eq.nom}
+                  {eq.code ? ` [${eq.code}]` : ""}
+                </span>
+              ))}
+            </div>
           </div>
         )}
 

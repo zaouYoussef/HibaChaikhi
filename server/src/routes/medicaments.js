@@ -46,6 +46,11 @@ function containsInsensitive(value) {
   return { contains: value };
 }
 
+function startsWithInsensitive(value) {
+  if (supportsInsensitiveMode) return { startsWith: value, mode: "insensitive" };
+  return { startsWith: value };
+}
+
 function equalsInsensitive(value) {
   if (supportsInsensitiveMode) return { equals: value, mode: "insensitive" };
   return { equals: value };
@@ -778,22 +783,27 @@ async function fetchLocalAndReferenceSuggestions(query) {
   const localRows = await prisma.medicament.findMany({
     where: {
       OR: candidates.flatMap((candidate) => [
+        { nom: startsWithInsensitive(candidate) },
         { nom: containsInsensitive(candidate) },
+        { principeActif: startsWithInsensitive(candidate) },
         { principeActif: containsInsensitive(candidate) },
       ]),
     },
     orderBy: { nom: "asc" },
-    take: 40,
+    take: 120,
   });
-  const localSuggestions = localRows.map((m) => ({
-    code: cleanText(m.codeBarre),
-    nom: m.nom,
-    dosage: m.dosage,
-    principeActif: m.principeActif,
-    equivalents: [],
-    source: "local",
-  }));
   const nq = normalizeForMatch(query);
+  const localSuggestions = localRows
+    .map((m) => ({
+      code: cleanText(m.codeBarre),
+      nom: m.nom,
+      dosage: m.dosage,
+      principeActif: m.principeActif,
+      equivalents: [],
+      source: "local",
+      _score: scoreCatalogMatch(nq, m) + 30,
+    }))
+    .sort((a, b) => b._score - a._score || a.nom.localeCompare(b.nom));
   const referenceCatalog = await loadReferenceSuggestionCatalog();
   const referenceSuggestions = referenceCatalog
     .map((item) => {
@@ -831,7 +841,7 @@ async function fetchLocalAndReferenceSuggestions(query) {
     .filter((entry) => entry.score >= 25)
     .sort((a, b) => b.score - a.score)
     .slice(0, 120)
-    .map((entry) => entry.item);
+    .map((entry) => ({ ...entry.item, _score: entry.score }));
 
   return { localSuggestions, referenceSuggestions };
 }
@@ -844,10 +854,9 @@ export async function suggestMedicaments(req, res) {
 
   const { localSuggestions, referenceSuggestions } =
     await fetchLocalAndReferenceSuggestions(q);
-  const merged = [
-    ...localSuggestions,
-    ...referenceSuggestions,
-  ];
+  const merged = [...localSuggestions, ...referenceSuggestions].sort(
+    (a, b) => Number(b?._score ?? 0) - Number(a?._score ?? 0)
+  );
   const seen = new Set();
   const items = [];
 
@@ -856,10 +865,13 @@ export async function suggestMedicaments(req, res) {
     if (!key || seen.has(key)) continue;
     seen.add(key);
     items.push(row);
-    if (items.length >= 30) break;
+    if (items.length >= 60) break;
   }
 
-  return res.json({ query: q, items });
+  return res.json({
+    query: q,
+    items: items.map(({ _score, ...rest }) => rest),
+  });
 }
 
 export async function autocompleteMedicaments(req, res) {
@@ -957,63 +969,6 @@ export async function searchMedicaments(req, res) {
     });
   }
 
-  const equivalents = altMeds
-    .map((m) => summarizeMedicament(m))
-    .filter((m) => m.id !== directMatches?.[0]?.id);
-
-  const referenceCatalog = await loadReferenceSuggestionCatalog();
-  const referenceQueryRows = referenceCatalog
-    .map((row) => ({ row, score: scoreCatalogMatch(q, row) }))
-    .filter((entry) => entry.score >= 40)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 20)
-    .map((entry) => entry.row);
-  const referenceEquivalentRows = referenceCatalog
-    .filter((row) => {
-      const pa = normalizeText(row.principeActif);
-      if (!pa) return false;
-      return paList.some((candidatePa) => normalizeText(candidatePa) === pa);
-    })
-    .filter((row) => normalizeText(row.nom) !== normalizeText(q))
-    .slice(0, 20);
-  const referencePool = [...referenceEquivalentRows, ...referenceQueryRows];
-  const referenceDedup = new Map();
-  for (const row of referencePool) {
-    const key = buildSuggestionKey(row);
-    if (!key || referenceDedup.has(key)) continue;
-    referenceDedup.set(key, row);
-  }
-
-  const normalizedLocalEqKeys = new Set(
-    equivalents.map(
-      (m) =>
-        `${normalizeText(m.nom)}|${normalizeText(m.principeActif)}|${normalizeText(m.dosage)}`
-    )
-  );
-  const catalogEquivalents = [...referenceDedup.values()]
-    .map((row) => ({
-      id: null,
-      nom: cleanText(row.nom),
-      principeActif: cleanText(row.principeActif),
-      dosage: cleanText(row.dosage),
-      codeBarre: cleanText(row.code),
-      quantite: 0,
-      dateExpiration: null,
-      stockStatus: "catalog",
-      lots: [],
-      source: cleanText(row.source || "data_txt"),
-    }))
-    .filter((row) => row.nom)
-    .filter(
-      (row) =>
-        !normalizedLocalEqKeys.has(
-          `${normalizeText(row.nom)}|${normalizeText(row.principeActif)}|${normalizeText(
-            row.dosage
-          )}`
-        )
-    );
-  const allEquivalents = [...equivalents, ...catalogEquivalents];
-
   const equivalentAvailableLots = altMeds
     .flatMap((m) =>
       (m.lots ?? [])
@@ -1025,6 +980,13 @@ export async function searchMedicaments(req, res) {
         new Date(a.lot.dateExpiration).getTime() -
         new Date(b.lot.dateExpiration).getTime()
     );
+  const allEquivalents = [];
+  const seenEquivalentIds = new Set();
+  for (const { medicament, lot } of equivalentAvailableLots) {
+    if (seenEquivalentIds.has(medicament.id)) continue;
+    seenEquivalentIds.add(medicament.id);
+    allEquivalents.push(mapMed(medicament, lot));
+  }
 
   if (equivalentAvailableLots.length > 0) {
     const recommended = equivalentAvailableLots[0];
@@ -1042,7 +1004,7 @@ export async function searchMedicaments(req, res) {
 
   return res.json({
     status: "non_disponible",
-    message: "Médicament non disponible",
+    message: "Aucun médicament disponible en stock pour cette recherche.",
     recommended: null,
     items: [],
     equivalents: allEquivalents,

@@ -173,7 +173,7 @@ export default function SearchPage() {
                       <span className="block text-xs text-slate-500">
                         {s.principeActif || "Principe actif inconnu"}
                         {s.dosage ? ` · ${s.dosage}` : ""}
-                        {s.source === "local" ? " · Local" : " · API RxNorm"}
+                        {" · Base locale"}
                       </span>
                     </button>
                   </li>
