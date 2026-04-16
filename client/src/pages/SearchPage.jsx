@@ -307,7 +307,13 @@ export default function SearchPage() {
                         equivalentDispo ? "border border-amber-100" : "border border-emerald-100"
                       }`}
                     >
-                      <span>{it.nom}</span>
+                      <div>
+                        <span>{it.nom}</span>
+                        <span className="block text-xs text-slate-500">
+                          {it.principeActif || "Principe actif inconnu"}
+                          {it.dosage ? ` · ${it.dosage}` : ""}
+                        </span>
+                      </div>
                       <span className="text-slate-600">
                         Lot {it.numeroLot || "—"} · {it.quantite} ·{" "}
                         {formatDate(it.dateExpiration)}

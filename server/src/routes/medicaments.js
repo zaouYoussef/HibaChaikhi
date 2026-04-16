@@ -1027,12 +1027,33 @@ export async function searchMedicaments(req, res) {
   // equivalence references (searching "PARANTAL" should map to Paracétamol).
   if (principles.size === 0 && q.length >= 2) {
     const equivalentHints = await prisma.equivalent.findMany({
-      where: { nomMedicament: containsInsensitive(q) },
+      where: {
+        OR: [
+          { nomMedicament: startsWithInsensitive(q) },
+          { nomMedicament: containsInsensitive(q) },
+        ],
+      },
       select: { principeActif: true },
-      take: 20,
+      take: 80,
     });
     for (const row of equivalentHints) {
       const pa = row?.principeActif?.trim();
+      if (pa) principles.add(pa);
+    }
+  }
+
+  // Last local fallback: infer principle from the local reference catalog
+  // (e.g. "PARANTAL" -> PARACETAMOL) even if equivalence table is not yet synced.
+  if (principles.size === 0 && q.length >= 2) {
+    const referenceCatalog = await loadReferenceSuggestionCatalog();
+    const best = referenceCatalog
+      .map((row) => ({ row, score: scoreCatalogMatch(q, row) }))
+      .filter((entry) => entry.score >= 70)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10)
+      .map((entry) => entry.row);
+    for (const row of best) {
+      const pa = cleanText(row?.principeActif);
       if (pa) principles.add(pa);
     }
   }
@@ -1204,11 +1225,50 @@ router.post("/", async (req, res) => {
     const eqDosage = cleanText(eq?.dosage);
     const eqCode = cleanText(eq?.codeBarres);
     if (!eqNom || !eqPA) continue;
+    // Keep plain equivalent name for simple search/display.
+    proposedNomMeds.push({ principeActif: eqPA, nomMed: eqNom });
     let nomMed = eqNom;
     if (eqDosage) nomMed += ` · ${eqDosage}`;
     if (eqPA) nomMed += ` · ${eqPA}`;
     if (eqCode) nomMed += ` [${eqCode}]`;
     proposedNomMeds.push({ principeActif: eqPA, nomMed });
+  }
+
+  // Safety net: derive equivalents directly from the local reference catalog for this drug.
+  const catalogRows = await loadReferenceSuggestionCatalog();
+  const targetNom = normalizeText(nom);
+  const targetPA = normalizeText(principeActif);
+  const targetDosage = normalizeText(dosage);
+  const matchingCatalogRows = catalogRows.filter((row) => {
+    const rn = normalizeText(row?.nom);
+    const rpa = normalizeText(row?.principeActif);
+    const rd = normalizeText(row?.dosage);
+    if (!rn || !rpa) return false;
+    if (rn !== targetNom || rpa !== targetPA) return false;
+    // If dosage exists on both sides, prefer exact dosage match.
+    if (targetDosage && rd && rd !== targetDosage) return false;
+    return true;
+  });
+  const catalogRowsByCode = new Map(
+    catalogRows
+      .map((row) => [normalizeCode(row?.code), row])
+      .filter(([code]) => Boolean(code))
+  );
+  for (const row of matchingCatalogRows) {
+    for (const eq of Array.isArray(row?.equivalents) ? row.equivalents : []) {
+      const eqNom = cleanText(eq?.nom);
+      const eqCode = normalizeCode(eq?.code);
+      if (!eqNom) continue;
+      const eqDetail = eqCode ? catalogRowsByCode.get(eqCode) : null;
+      const eqPA = cleanText(eqDetail?.principeActif) || cleanText(principeActif);
+      const eqDosage = cleanText(eqDetail?.dosage);
+      proposedNomMeds.push({ principeActif: eqPA, nomMed: eqNom });
+      let detailed = eqNom;
+      if (eqDosage) detailed += ` · ${eqDosage}`;
+      if (eqPA) detailed += ` · ${eqPA}`;
+      if (eqCode) detailed += ` [${eqCode}]`;
+      proposedNomMeds.push({ principeActif: eqPA, nomMed: detailed });
+    }
   }
 
   const allToInsert = [
