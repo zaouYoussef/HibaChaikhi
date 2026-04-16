@@ -1023,6 +1023,20 @@ export async function searchMedicaments(req, res) {
     directMatches.map((m) => m.principeActif.trim()).filter(Boolean)
   );
 
+  // If nothing matched directly, try to infer the principle from our saved
+  // equivalence references (searching "PARANTAL" should map to Paracétamol).
+  if (principles.size === 0 && q.length >= 2) {
+    const equivalentHints = await prisma.equivalent.findMany({
+      where: { nomMedicament: containsInsensitive(q) },
+      select: { principeActif: true },
+      take: 20,
+    });
+    for (const row of equivalentHints) {
+      const pa = row?.principeActif?.trim();
+      if (pa) principles.add(pa);
+    }
+  }
+
   // Fallback approximation: used only to infer active principle,
   // never to mark query as directly "disponible".
   if (principles.size === 0) {

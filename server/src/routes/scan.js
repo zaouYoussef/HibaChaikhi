@@ -1,6 +1,5 @@
 import { Router } from "express";
 import { z } from "zod";
-import { load } from "cheerio";
 import { createWorker } from "tesseract.js";
 import * as XLSX from "xlsx";
 import { readdir, readFile } from "node:fs/promises";
@@ -1035,208 +1034,6 @@ async function storeEquivalentReferencesBulk(principeActif, names) {
   return stored;
 }
 
-function dedupeEquivalentItems(items) {
-  const seen = new Set();
-  const out = [];
-  for (const item of items ?? []) {
-    const key = `${normalizeText(item?.nom)}|${normalizeText(item?.principeActif)}|${normalizeText(item?.dosage)}`;
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
-  }
-  return out;
-}
-
-function isValidEquivalentName(name) {
-  const value = cleanText(name);
-  if (!value) return false;
-  if (value.length < 3 || value.length > 120) return false;
-  if (value.includes("{") || value.includes("}")) return false;
-  if (/\bpack\b/i.test(value)) return false;
-  if (value.split("/").length > 2) return false;
-  return true;
-}
-
-function looksUnknownPrinciple(value) {
-  const v = normalizeText(value);
-  if (!v) return true;
-  return (
-    v.includes("non renseigne") ||
-    v.includes("non renseigné") ||
-    v.includes("inconnu")
-  );
-}
-
-function normalizeDosageToken(value) {
-  return cleanText(value).replace(/\s+/g, "").toLowerCase();
-}
-
-function splitNameAndStrength(value) {
-  const raw = cleanText(value);
-  if (!raw) return { name: "", dosage: "" };
-  const dosage = extractDosageCandidates(raw)[0] || "";
-  if (!dosage) return { name: raw, dosage: "" };
-  const idx = raw.toLowerCase().indexOf(dosage.toLowerCase());
-  if (idx <= 0) return { name: raw, dosage };
-  return {
-    name: cleanText(raw.slice(0, idx)).replace(/[-,;:\s]+$/g, ""),
-    dosage,
-  };
-}
-
-async function fetchPrincipleFromRxNorm({ nom, dosage }) {
-  const query = cleanText(nom);
-  if (query.length < 2) return "";
-  const dosageToken = normalizeDosageToken(dosage);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  try {
-    const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return "";
-    const body = await res.json();
-    const groups = body?.drugGroup?.conceptGroup ?? [];
-    const concepts = groups.flatMap((g) => g?.conceptProperties ?? []);
-    let fallback = "";
-    for (const concept of concepts) {
-      const label = cleanText(concept?.name);
-      if (!label) continue;
-      const parsed = splitNameAndStrength(label);
-      const candidatePrinciple = cleanText(parsed.name);
-      if (!candidatePrinciple) continue;
-      if (!fallback) fallback = candidatePrinciple;
-      if (!dosageToken) return candidatePrinciple;
-      if (
-        normalizeDosageToken(parsed.dosage) === dosageToken ||
-        normalizeText(label).includes(normalizeText(dosage))
-      ) {
-        return candidatePrinciple;
-      }
-    }
-    return fallback;
-  } catch {
-    return "";
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchPrincipleFromOpenFda({ nom }) {
-  const query = cleanText(nom);
-  if (query.length < 2) return "";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  try {
-    const escaped = query.replace(/"/g, '\\"');
-    const searches = [
-      `openfda.brand_name:"${escaped}"`,
-      `openfda.brand_name:${escaped}*`,
-      `openfda.generic_name:${escaped}*`,
-    ];
-    for (const search of searches) {
-      const url = `https://api.fda.gov/drug/label.json?search=${encodeURIComponent(
-        search
-      )}&limit=3`;
-      // eslint-disable-next-line no-await-in-loop
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) continue;
-      // eslint-disable-next-line no-await-in-loop
-      const body = await res.json();
-      const rows = Array.isArray(body?.results) ? body.results : [];
-      for (const row of rows) {
-        const pa = cleanText(row?.openfda?.generic_name?.[0]);
-        if (pa) return pa;
-        const substances = row?.active_ingredient;
-        if (Array.isArray(substances) && substances.length > 0) {
-          const first = splitNameAndStrength(substances[0]);
-          if (first.name) return first.name;
-        }
-      }
-    }
-    return "";
-  } catch {
-    return "";
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function enrichPrincipleFromWeb(medicament) {
-  const current = cleanText(medicament?.principeActif);
-  if (current && !looksUnknownPrinciple(current)) {
-    return medicament;
-  }
-  const nom = cleanText(medicament?.nom);
-  const dosage = cleanText(medicament?.dosage);
-  if (!nom) return medicament;
-
-  const fromRxNorm = await fetchPrincipleFromRxNorm({ nom, dosage });
-  if (fromRxNorm) {
-    return {
-      ...medicament,
-      principeActif: fromRxNorm,
-      source: `${medicament?.source || "external"}+rxnorm_pa`,
-    };
-  }
-  const fromOpenFda = await fetchPrincipleFromOpenFda({ nom });
-  if (fromOpenFda) {
-    return {
-      ...medicament,
-      principeActif: fromOpenFda,
-      source: `${medicament?.source || "external"}+openfda_pa`,
-    };
-  }
-  return medicament;
-}
-
-async function fetchRxNormWebEquivalents({ nom, principeActif }) {
-  const query = cleanText(principeActif || nom);
-  if (query.length < 2) return [];
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4500);
-  try {
-    const url = `https://rxnav.nlm.nih.gov/REST/drugs.json?name=${encodeURIComponent(
-      query
-    )}`;
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const groups = data?.drugGroup?.conceptGroup ?? [];
-    const concepts = groups.flatMap((g) => g?.conceptProperties ?? []);
-    const results = concepts
-      .map((c) => String(c?.name ?? "").trim())
-      .filter(Boolean)
-      .map((raw) => {
-        const normalizedName = raw.replace(/acetaminophen/gi, "paracetamol").trim();
-        const dosageMatch = normalizedName.match(
-          /\b\d+(?:[.,]\d+)?\s?(?:mg|g|mcg|ug|µg|ml|iu|ui)\b/i
-        );
-        const dosage = dosageMatch ? dosageMatch[0] : "";
-        const pa = cleanText(
-          principeActif ||
-            (dosageMatch
-              ? normalizedName.slice(0, dosageMatch.index)
-              : normalizedName.split(/\s+/).slice(0, 2).join(" "))
-        );
-        return {
-          nom: normalizedName,
-          principeActif: pa,
-          dosage,
-          source: "rxnorm_web",
-        };
-      })
-      .filter((row) => isValidEquivalentName(row.nom))
-      .filter((row) => normalizeText(row.nom) !== normalizeText(nom))
-      .slice(0, 10);
-    return dedupeEquivalentItems(results);
-  } catch {
-    return [];
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function getOcrWorker() {
   if (!ocrWorkerPromise) {
     ocrWorkerPromise = createWorker("fra+eng").catch((err) => {
@@ -1476,134 +1273,6 @@ async function inferMedicationFromOcrText(ocrText) {
   };
 }
 
-function isBarcodeLike(value, barcode) {
-  const raw = String(value ?? "").trim();
-  if (!raw) return true;
-  const normalized = raw.replace(/\s+/g, "");
-  if (normalized === barcode) return true;
-  if (/^\d{6,}$/.test(normalized)) return true;
-  return false;
-}
-
-async function fetchMedicamentsMoroccoByBarcode(barcode) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 7000);
-  const url = `https://medicament.ma/?choice=barcode&s=${encodeURIComponent(barcode)}`;
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "caravane-medicale/1.0",
-      },
-    });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const $ = load(html);
-    const ogTitle = cleanText($('meta[property="og:title"]').attr("content"))
-      .replace(/\s+-\s*Medicament\.ma\s*$/i, "")
-      .replace(/^Recherche de\s*/i, "")
-      .replace(/^Recherche\s*-\s*/i, "")
-      .trim();
-    const nom = cleanText($(".single.single-medicament > h3").first().text()) || ogTitle;
-    if (!nom || isBarcodeLike(nom, barcode)) return null;
-    const lowerNom = nom.toLowerCase();
-    if (
-      lowerNom.includes("page non trouvee") ||
-      lowerNom.includes("médicament non trouvé") ||
-      lowerNom.includes("medicament non trouve") ||
-      lowerNom.includes("suggestions")
-    ) {
-      return null;
-    }
-
-    const principeActif = cleanText(
-      $("tr.field-composition > .value").first().text()
-    );
-    const presentation = cleanText(
-      $("tr.field-presentation > .value").first().text()
-    );
-
-    return {
-      nom,
-      principeActif,
-      dosage: presentation || "",
-      source: "medicaments_morocco",
-    };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function pickFirstNonEmpty(record, keys) {
-  for (const key of keys) {
-    const value = cleanText(record?.[key]);
-    if (value) return value;
-  }
-  return "";
-}
-
-async function fetchDataGovMaByBarcode(barcode) {
-  const resourceId = process.env.DATAGOVMA_RESOURCE_ID?.trim();
-  if (!resourceId) return null;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-  const endpoint =
-    process.env.DATAGOVMA_SEARCH_URL?.trim() ||
-    "https://www.data.gov.ma/data/api/3/action/datastore_search";
-  const url = new URL(endpoint);
-  url.searchParams.set("resource_id", resourceId);
-  url.searchParams.set("q", barcode);
-  url.searchParams.set("limit", "1");
-
-  try {
-    const res = await fetch(url.toString(), { signal: controller.signal });
-    if (!res.ok) return null;
-    const payload = await res.json();
-    const record = payload?.result?.records?.[0];
-    if (!record) return null;
-
-    const nom = pickFirstNonEmpty(record, [
-      "nom",
-      "nom_commercial",
-      "denomination",
-      "denomination_commune",
-      "specialite",
-      "medicament",
-      "libelle",
-      "produit",
-    ]);
-    const principeActif = pickFirstNonEmpty(record, [
-      "principe_actif",
-      "dci",
-      "substance_active",
-      "composition",
-      "ingredient_actif",
-    ]);
-    const dosage = pickFirstNonEmpty(record, [
-      "dosage",
-      "presentation",
-      "forme_dosage",
-      "concentration",
-      "specification",
-    ]);
-
-    if (!nom || isBarcodeLike(nom, barcode)) return null;
-    return {
-      nom,
-      principeActif: principeActif || "Principe actif non renseigné",
-      dosage,
-      source: "data_gov_ma",
-    };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 router.post("/", async (req, res) => {
   const parsed = scanSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -1667,7 +1336,9 @@ router.post("/", async (req, res) => {
 
   if (local) {
     const equivalents = (catalogHit?.equivalents ?? [])
-      .filter((eq) => eq?.nom && eq?.code !== code)
+      // On filtre le produit "principal" selon le code réellement utilisé pour trouver `catalogHit`.
+      // Sinon, on peut afficher un équivalent qui correspond en réalité au même produit que celui scanné.
+      .filter((eq) => eq?.nom && eq?.code !== matchedCatalogCode)
       .slice(0, 10)
       .map((eq) => ({
         nom: eq.nom,
@@ -1695,7 +1366,8 @@ router.post("/", async (req, res) => {
 
   if (catalogHit) {
     const equivalents = (catalogHit.equivalents ?? [])
-      .filter((eq) => eq?.nom && eq?.code !== code)
+      // Même logique: exclure le produit correspondant au `catalogHit` utilisé.
+      .filter((eq) => eq?.nom && eq?.code !== matchedCatalogCode)
       .slice(0, 10)
       .map((eq) => ({
         nom: eq.nom,
