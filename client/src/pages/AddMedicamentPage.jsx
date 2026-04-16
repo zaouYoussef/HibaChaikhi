@@ -103,10 +103,12 @@ function normalizeEquivalentItems(items) {
     const nom = String(row?.nom || row?.nomMedicament || "").trim();
     if (!nom) continue;
     const code = String(row?.code || row?.codeBarres || "").trim();
-    const key = `${nom.toLowerCase()}|${code}`;
+    const principeActif = String(row?.principeActif || "").trim();
+    const dosage = String(row?.dosage || "").trim();
+    const key = `${nom.toLowerCase()}|${code}|${dosage.toLowerCase()}|${principeActif.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ nom, code });
+    out.push({ nom, code, principeActif, dosage });
   }
   return out.slice(0, 30);
 }
@@ -307,9 +309,14 @@ export default function AddMedicamentPage() {
           numeroLot: form.numeroLot.trim(),
           quantite: Number(form.quantite),
           dateExpiration: parsedExpiration,
-          equivalentNames: proposedEquivalents
-            .map((eq) => String(eq?.nom ?? "").trim())
-            .filter(Boolean),
+          equivalentMedicaments: proposedEquivalents
+            .map((eq) => ({
+              nom: String(eq?.nom ?? "").trim(),
+              principeActif: String(eq?.principeActif ?? "").trim(),
+              dosage: String(eq?.dosage ?? "").trim(),
+              codeBarres: String(eq?.code ?? "").trim(),
+            }))
+            .filter((eq) => eq.nom),
         }),
       });
       setMsg({ type: "ok", text: "Médicament enregistré." });

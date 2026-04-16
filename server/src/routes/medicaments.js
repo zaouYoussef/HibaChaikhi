@@ -39,6 +39,17 @@ const medicamentCreateSchema = z.object({
   dateExpiration: z.coerce.date({ invalid_type_error: "Date invalide" }),
   codeBarre: z.string().max(120).optional().nullable(),
   equivalentNames: z.array(z.string().min(1).max(300)).optional().default([]),
+  equivalentMedicaments: z
+    .array(
+      z.object({
+        nom: z.string().min(1).max(300),
+        principeActif: z.string().min(1).max(300),
+        dosage: z.string().max(120).optional().nullable(),
+        codeBarres: z.string().max(120).optional().nullable(),
+      })
+    )
+    .optional()
+    .default([]),
 });
 
 function containsInsensitive(value) {
@@ -1102,6 +1113,7 @@ router.post("/", async (req, res) => {
     dateExpiration,
     codeBarre,
     equivalentNames,
+    equivalentMedicaments,
   } = parsed.data;
   const lotValue =
     numeroLot?.trim() ||
@@ -1161,14 +1173,49 @@ router.post("/", async (req, res) => {
     select: { nom: true },
     take: 200,
   });
-  const suggestedNames = [...new Set((equivalentNames ?? []).map((x) => cleanText(x)).filter(Boolean))];
-  const allEquivalentNames = [
-    ...samePrincipleMeds.map((m) => cleanText(m.nom)),
-    ...suggestedNames,
+
+  const suggestedNames = [
+    ...(Array.isArray(equivalentNames) ? equivalentNames : []),
+  ].map((x) => cleanText(x)).filter(Boolean);
+
+  // Proposed equivalents should be saved with dosage/principeActif/code
+  // embedded in the stored equivalent "nomMedicament" string.
+  const proposedEquivalentEntries = Array.isArray(equivalentMedicaments)
+    ? equivalentMedicaments
+    : [];
+  const proposedNomMeds = [];
+  for (const eq of proposedEquivalentEntries) {
+    const eqNom = cleanText(eq?.nom);
+    const eqPA = cleanText(eq?.principeActif) || cleanText(principeActif);
+    const eqDosage = cleanText(eq?.dosage);
+    const eqCode = cleanText(eq?.codeBarres);
+    if (!eqNom || !eqPA) continue;
+    let nomMed = eqNom;
+    if (eqDosage) nomMed += ` · ${eqDosage}`;
+    if (eqPA) nomMed += ` · ${eqPA}`;
+    if (eqCode) nomMed += ` [${eqCode}]`;
+    proposedNomMeds.push({ principeActif: eqPA, nomMed });
+  }
+
+  const allToInsert = [
+    ...samePrincipleMeds.map((m) => ({
+      principeActif: cleanText(principeActif),
+      nomMed: cleanText(m.nom),
+    })),
+    ...proposedNomMeds,
+    ...suggestedNames.map((name) => ({
+      principeActif: cleanText(principeActif),
+      nomMed: cleanText(name),
+    })),
   ];
-  for (const equivalentName of allEquivalentNames) {
+
+  const seen = new Set();
+  for (const entry of allToInsert) {
+    const key = `${entry.principeActif}|${entry.nomMed}`;
+    if (!entry.principeActif || !entry.nomMed || seen.has(key)) continue;
+    seen.add(key);
     // eslint-disable-next-line no-await-in-loop
-    await ensureEquivalentReference(principeActif, equivalentName);
+    await ensureEquivalentReference(entry.principeActif, entry.nomMed);
   }
 
   res.status(201).json(summarizeMedicament(result));
