@@ -316,7 +316,7 @@ export default function AddMedicamentPage() {
               dosage: String(eq?.dosage ?? "").trim(),
               codeBarres: String(eq?.code ?? "").trim(),
             }))
-            .filter((eq) => eq.nom),
+            .filter((eq) => eq.nom && eq.principeActif),
         }),
       });
       setMsg({ type: "ok", text: "Médicament enregistré." });
