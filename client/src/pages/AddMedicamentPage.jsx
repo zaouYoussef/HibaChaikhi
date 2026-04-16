@@ -312,8 +312,10 @@ export default function AddMedicamentPage() {
           equivalentMedicaments: proposedEquivalents
             .map((eq) => ({
               nom: String(eq?.nom ?? "").trim(),
-              principeActif: String(eq?.principeActif ?? "").trim(),
-              dosage: String(eq?.dosage ?? "").trim(),
+              // Fallback: on prend le PA/dosage du formulaire si jamais le scan ne les renvoie pas.
+              principeActif: String(eq?.principeActif ?? form.principeActif ?? "")
+                .trim(),
+              dosage: String(eq?.dosage ?? form.dosage ?? "").trim(),
               codeBarres: String(eq?.code ?? "").trim(),
             }))
             .filter((eq) => eq.nom && eq.principeActif),
